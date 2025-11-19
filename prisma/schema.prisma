@@ -1,0 +1,181 @@
+generator client {
+    provider = "prisma-client-js"
+}
+
+datasource db {
+    provider = "postgresql"
+    // or "postgresql", "mysql", etc.
+    url      = env("DATABASE_URL")
+}
+
+model Group {
+    id       String  @id @default(uuid())
+    name     String  @unique
+    users    User[]
+    parentId String?
+    parent   Group?  @relation("GroupToParent", fields: [parentId], references: [id])
+    children Group[] @relation("GroupToParent")
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+}
+
+model Consumable {
+    id        String @id @default(uuid())
+    item      Item?  @relation(name: "ItemToConsumable", fields: [itemId], references: [id])
+    itemId    String @unique
+    available Int
+    total     Int
+}
+
+model Item {
+    id          String       @id @default(uuid())
+    serial      String       @unique
+    image       String?
+    name        String
+    location    Location     @relation(fields: [locationId], references: [id])
+    locationId  String
+    stored      Boolean      @default(true)
+    tags        Tag[]
+    cost        Int          @default(0)
+    createdAt   DateTime     @default(now())
+    updatedAt   DateTime     @updatedAt
+    consumable  Consumable?  @relation(name: "ItemToConsumable")
+    ItemRecords ItemRecord[] @relation("ItemToItemRecord")
+    deleted     Boolean      @default(false)
+
+    @@index([serial])
+    @@index([locationId])
+}
+
+model Tag {
+    id        String     @id @default(uuid())
+    name      String
+    type      String
+    createdAt DateTime   @default(now())
+    updatedAt DateTime   @updatedAt
+    items     Item[]
+    colour    String     @default("#000000")
+    TagGroup  TagGroup[]
+
+    @@unique([name, type, colour])
+}
+
+model TagGroup {
+    id       String     @id @default(uuid())
+    name     String     @unique
+    parentId String?
+    parent   TagGroup?  @relation("TagGroupHierarchy", fields: [parentId], references: [id])
+    children TagGroup[] @relation("TagGroupHierarchy")
+    tags     Tag[]
+}
+
+model Location {
+    id        String     @id @default(uuid())
+    name      String     @unique
+    parentId  String?
+    parent    Location?  @relation("LocationToParent", fields: [parentId], references: [id])
+    children  Location[] @relation("LocationToParent")
+    items     Item[]
+    createdAt DateTime   @default(now())
+    updatedAt DateTime   @updatedAt
+}
+
+model ItemRecord {
+    id             String   @id @default(uuid())
+    loaned         Boolean
+    actionBy       User     @relation("UserToItemRecord", fields: [actionByUserId], references: [id])
+    actionByUserId String
+    item           Item     @relation("ItemToItemRecord", fields: [itemId], references: [id])
+    itemId         String
+    notes          String?
+    quantity       Int      @default(1)
+    createdAt      DateTime @default(now())
+
+    @@index([itemId])
+    @@index([actionByUserId])
+    @@index([itemId, loaned])
+}
+
+model User {
+    id            String       @id @default(uuid())
+    name          String
+    email         String       @unique
+    emailVerified Boolean
+    image         String?
+    group         Group?       @relation(fields: [groupId], references: [id])
+    groupId       String?
+    createdAt     DateTime     @default(now())
+    updatedAt     DateTime     @updatedAt
+    sessions      Session[]
+    accounts      Account[]
+    ItemRecords   ItemRecord[] @relation("UserToItemRecord")
+
+    role       String    @default("user")
+    banned     Boolean?
+    banReason  String?
+    banExpires DateTime?
+
+    @@index([email])
+    @@index([groupId])
+    @@map("user")
+}
+
+model Session {
+    id        String   @id
+    expiresAt DateTime
+    token     String
+    createdAt DateTime
+    updatedAt DateTime
+    ipAddress String?
+    userAgent String?
+    userId    String
+    user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    impersonatedBy String?
+
+    @@unique([token])
+    @@map("session")
+}
+
+model Account {
+    id                    String    @id
+    accountId             String
+    providerId            String
+    userId                String
+    user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+    accessToken           String?
+    refreshToken          String?
+    idToken               String?
+    accessTokenExpiresAt  DateTime?
+    refreshTokenExpiresAt DateTime?
+    scope                 String?
+    password              String?
+    createdAt             DateTime
+    updatedAt             DateTime
+
+    @@map("account")
+}
+
+model Verification {
+    id         String    @id
+    identifier String
+    value      String
+    expiresAt  DateTime
+    createdAt  DateTime?
+    updatedAt  DateTime?
+
+    @@map("verification")
+}
+
+model Chat {
+  id                String   @id @default(uuid())
+  title             String   @default("New Conversation")
+  messageIdCounter  Int      @default(1)
+  aiMessages        Json     // Stores Record<string, AIMessageData>
+  userMessages      Json     // Stores Record<string, UserMessageData>
+  aiMessageChildIds Json     // Stores Record<string, string[]>
+  userMessageChildIds Json   // Stores Record<string, string[]>
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}

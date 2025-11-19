@@ -1,0 +1,1 @@
+bun run gitlint && bun run format && bun run test && FILES=$(git diff --cached --name-only --diff-filter=ACM); if [ -n \"$FILES\" ]; then git add $FILES; else echo 'No files to add'; fi
