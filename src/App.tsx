@@ -16,7 +16,6 @@ import ItemDetails from "@/pages/ItemDetails.tsx";
 import { ProtectedLayout } from "@/auth/ProtectedLayout.tsx";
 import CheckIn from "@/pages/CheckIn.tsx";
 import Chat from "./pages/Chat";
-import LandingPage from "./pages/LandingPage";
 
 const App = () => {
   React.useEffect(() => {
@@ -34,7 +33,6 @@ const App = () => {
         <CartProvider>
           <Toaster position="top-right" richColors closeButton />
           <Routes>
-            <Route path="/" element={<LandingPage />} />
             <Route path="error" element={<ErrorPage />} />
             <Route path="/auth/:pathname" element={<AuthPage />} />
             <Route path="/" element={<ProtectedLayout />}>
