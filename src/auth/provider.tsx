@@ -10,8 +10,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       authClient={authClient}
       navigate={void navigate}
       credentials={false}
-      social={{
-        providers: ["google"],
+      genericOAuth={{
+        providers: [{ provider: "authentik", name: "authentik" }],
       }}
       Link={
         NavLink as unknown as React.FC<{
