@@ -27,7 +27,7 @@ export default function PrintGcode() {
   const printersQuery = trpc.print.getPrinters.useQuery();
   const jobsQuery = trpc.print.listMyPrintJobs.useQuery();
 
-  const uploadMutation = trpc.print.uploadAndStore.useMutation({
+  const uploadAndStoreMutation = trpc.print.uploadAndStore.useMutation({
     onSuccess: (result) => {
       setLastStoredJob({
         id: result.id,
@@ -36,6 +36,19 @@ export default function PrintGcode() {
         status: result.status,
       });
       toast.success("G-code uploaded to printer, hashed, and stored locally.");
+      void jobsQuery.refetch();
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const uploadAndPrintMutation = trpc.print.uploadAndPrint.useMutation({
+    onSuccess: (result) => {
+      setLastStoredJob({
+        id: result.id,
+        originalFilename: result.originalFilename,
+        storedFilename: result.storedFilename,
+        status: result.status,
+      });
+      toast.success(result.dispatchResponse ?? "File uploaded and print dispatched.");
       void jobsQuery.refetch();
     },
     onError: (error) => toast.error(error.message),
@@ -61,16 +74,30 @@ export default function PrintGcode() {
   } | null>(null);
 
   const printerOptions = printersQuery.data ?? [];
+  const selectedPrinter =
+    printerOptions.find((printer) => printer.ipAddress === selectedPrinterIp) ?? null;
+  const isBambuSelected = selectedPrinter?.type === "BAMBU";
+  const isUploadPending =
+    uploadAndStoreMutation.isPending || uploadAndPrintMutation.isPending;
 
   const submitUpload = async (e: FormEvent) => {
     e.preventDefault();
     if (!selectedFile || !selectedPrinterIp) {
-      toast.error("Select a printer and a .gcode file.");
+      toast.error("Select a printer and a print file.");
       return;
     }
 
     const fileContentBase64 = await readFileAsBase64(selectedFile);
-    await uploadMutation.mutateAsync({
+    if (isBambuSelected) {
+      await uploadAndPrintMutation.mutateAsync({
+        printerIpAddress: selectedPrinterIp,
+        fileName: selectedFile.name,
+        fileContentBase64,
+      });
+      return;
+    }
+
+    await uploadAndStoreMutation.mutateAsync({
       printerIpAddress: selectedPrinterIp,
       fileName: selectedFile.name,
       fileContentBase64,
@@ -93,13 +120,15 @@ export default function PrintGcode() {
       <div>
         <h1 className="text-3xl font-bold">G-code Printing</h1>
         <p className="text-muted-foreground">
-          Upload a G-code/BGCode file to the printer, hash and archive it locally, then start printing as a separate step.
+          Prusa printers use upload/store then start. Bambu printers use upload-and-print (.3mf) via the local bridge.
         </p>
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle>Upload to printer, store, then print</CardTitle>
+          <CardTitle>
+            {isBambuSelected ? "Upload and print (Bambu)" : "Upload to printer, store, then print"}
+          </CardTitle>
         </CardHeader>
         <CardContent>
           <form onSubmit={submitUpload} className="space-y-4">
@@ -124,22 +153,25 @@ export default function PrintGcode() {
               ) : null}
             </div>
             <div className="space-y-2">
-              <Label>G-code file</Label>
+              <Label>{isBambuSelected ? "3MF file" : "G-code file"}</Label>
               <Input
                 type="file"
-                accept=".gcode,.gc,.gco,.bgcode,text/plain"
+                accept={isBambuSelected ? ".3mf,application/octet-stream" : ".gcode,.gc,.gco,.bgcode,text/plain"}
                 onChange={(e) => setSelectedFile(e.target.files?.[0] ?? null)}
               />
             </div>
             <Button
               type="submit"
-              disabled={uploadMutation.isPending || printersQuery.isLoading || printerOptions.length === 0}
+              disabled={isUploadPending || printersQuery.isLoading || printerOptions.length === 0}
             >
-              Upload to Printer, Hash, and Store
+              {isBambuSelected
+                ? "Upload to Bridge and Print"
+                : "Upload to Printer, Hash, and Store"}
             </Button>
           </form>
 
-          <div className="mt-6 space-y-3 border-t pt-4">
+          {!isBambuSelected ? (
+            <div className="mt-6 space-y-3 border-t pt-4">
             <div className="space-y-1">
               <Label>Stored file ready to start</Label>
               <p className="text-sm text-muted-foreground">
@@ -155,7 +187,8 @@ export default function PrintGcode() {
             >
               Start Print (Stored File)
             </Button>
-          </div>
+            </div>
+          ) : null}
 
           {jobsQuery.data && jobsQuery.data.length > 0 ? (
             <div className="mt-6 space-y-2 border-t pt-4">
@@ -175,14 +208,14 @@ export default function PrintGcode() {
                     <Button
                       type="button"
                       variant="outline"
-                      disabled={startPrintMutation.isPending}
+                      disabled={startPrintMutation.isPending || job.printer.type === "BAMBU"}
                       onClick={() =>
                         startPrintMutation.mutate({
                           printJobId: job.id,
                         })
                       }
                     >
-                      Start Print
+                      {job.printer.type === "BAMBU" ? "Start Print (Prusa only)" : "Start Print"}
                     </Button>
                   </div>
                 ))}

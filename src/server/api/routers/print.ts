@@ -359,6 +359,7 @@ const dispatchToPrinter = async (params: {
     body: JSON.stringify({
       ipAddress,
       serialNumber,
+      authToken,
       fileName: originalFilename,
       fileContentBase64: fileBuffer.toString("base64"),
     }),
