@@ -46,10 +46,10 @@ const dispatchToPrinter = async (params: {
       });
     }
 
-    type PrusaStatusResponse = {
+    interface PrusaStatusResponse {
       storage?: { name?: string; read_only?: boolean };
       printer?: { state?: string };
-    };
+    }
     const getPrusaStatus = async () => {
       const statusRes = await fetch(`http://${ipAddress}/api/v1/status`, {
         headers: {
