@@ -4,6 +4,7 @@ import { cors } from 'hono/cors';
 import { trpcServer } from '@hono/trpc-server';
 import { appRouter } from '@/server/api/routers/_app';
 import { auth } from '@/server/auth';
+import { prisma } from '@/server/lib/prisma';
 import { createContext } from '@/server/trpc';
 import { HTTPException } from 'hono/http-exception';
 import { logger } from "hono/logger";
@@ -72,6 +73,73 @@ app.onError((err, c) => {
 // Health check endpoint
 app.get('/health', (c) => c.json({ status: 'ok' }));
 
+// ─── Webcam proxy ────────────────────────────────────────────────────────────
+// Streams printer webcam feeds through the server so clients outside the local
+// network can view them. Requires an authenticated session.
+app.get('/api/webcam/:printerId', async (c) => {
+    const session = await auth.api.getSession({
+        headers: c.req.raw.headers,
+    });
+    if (!session?.user?.id) {
+        throw new HTTPException(401, { message: 'Authentication required' });
+    }
+
+    const printerId = c.req.param('printerId');
+    const printer = await prisma.printer.findUnique({
+        where: { id: printerId },
+        select: { webcamUrl: true, name: true },
+    });
+
+    if (!printer || !printer.webcamUrl) {
+        throw new HTTPException(404, { message: 'Printer or webcam URL not found' });
+    }
+
+    // Convert stream URL to snapshot URL when requested
+    let upstreamUrl = printer.webcamUrl;
+    const mode = c.req.query('mode');
+    if (mode === 'snapshot' && upstreamUrl.includes('action=stream')) {
+        upstreamUrl = upstreamUrl.replace('action=stream', 'action=snapshot');
+    }
+
+    // Abort upstream fetch when client disconnects
+    const upstream = new AbortController();
+    c.req.raw.signal.addEventListener('abort', () => upstream.abort());
+
+    let upstreamRes: Response;
+    try {
+        upstreamRes = await fetch(upstreamUrl, {
+            signal: upstream.signal,
+            headers: { Accept: '*/*' },
+        });
+    } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            return c.body(null, 499 as any);
+        }
+        console.error(`Webcam proxy failed for ${printer.name}:`, error);
+        throw new HTTPException(502, { message: 'Failed to connect to printer webcam' });
+    }
+
+    if (!upstreamRes.ok) {
+        throw new HTTPException(502, {
+            message: `Printer webcam returned HTTP ${upstreamRes.status}`,
+        });
+    }
+
+    if (!upstreamRes.body) {
+        throw new HTTPException(502, { message: 'Printer webcam returned empty body' });
+    }
+
+    // Forward content-type verbatim (critical for MJPEG multipart/x-mixed-replace)
+    const headers = new Headers();
+    const contentType = upstreamRes.headers.get('content-type');
+    if (contentType) headers.set('Content-Type', contentType);
+    const contentLength = upstreamRes.headers.get('content-length');
+    if (contentLength) headers.set('Content-Length', contentLength);
+    headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    headers.set('X-Accel-Buffering', 'no');
+
+    return new Response(upstreamRes.body, { status: 200, headers });
+});
 
 // MCP route
 app.use('/mcp', basicAuth({
