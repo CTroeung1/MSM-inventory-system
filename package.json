@@ -19,7 +19,6 @@
         "preview": "vite preview",
         "dev:backend": "bun --hot server/index.ts",
         "backend": "bun --hot server/index.ts",
-        "bambu:bridge": "echo 'Bambu bridge is now integrated into the main server via tRPC'",
         "test": "vitest run",
         "test:watch": "vitest --watch",
         "prepare": "husky",
