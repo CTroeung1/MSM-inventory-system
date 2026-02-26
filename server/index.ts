@@ -13,6 +13,7 @@ import { createMcpServer } from 'trpc-to-mcp';
 import { basicAuth } from 'hono/basic-auth'
 
 
+
 // Load environment variables
 config();
 
@@ -141,10 +142,15 @@ app.get('/api/webcam/:printerId', async (c) => {
     return new Response(upstreamRes.body, { status: 200, headers });
 });
 
+
 // MCP route
+const mcpPassword = process.env.MCP_PASSWORD;
+if (!mcpPassword) {
+    throw new Error('MCP_PASSWORD environment variable is required');
+}
 app.use('/mcp', basicAuth({
     username: 'bot',
-    password: process.env.MCP_PASSWORD ?? 'mcppassword',
+    password: mcpPassword,
     realm: 'Inventory System MCP',
     invalidUserMessage: 'Access denied: Invalid credentials',
 }));

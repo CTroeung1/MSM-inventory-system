@@ -108,7 +108,7 @@ function PrinterFormFields({
       <div className="space-y-2">
         <Label>Webcam URL</Label>
         <Input
-          placeholder="e.g. http://172.24.200.81:8080/?action=stream (proxied through server)"
+          placeholder="e.g. http://172.24.200.81:8080/?action=stream"
           value={form.webcamUrl}
           onChange={(e) => onChange({ webcamUrl: e.target.value })}
         />
