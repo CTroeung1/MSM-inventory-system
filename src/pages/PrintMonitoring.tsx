@@ -22,11 +22,16 @@ type CameraMode = "stream" | "snapshot";
 
 const PAGE_SIZE = 12;
 
-const buildSnapshotUrl = (webcamUrl: string) => {
-  if (webcamUrl.includes("action=stream")) {
-    return webcamUrl.replace("action=stream", "action=snapshot");
+const buildProxyCameraUrl = (
+  printerId: string,
+  mode: CameraMode,
+  snapshotTick: number,
+): string => {
+  const base = `/api/webcam/${encodeURIComponent(printerId)}`;
+  if (mode === "snapshot") {
+    return `${base}?mode=snapshot&_t=${snapshotTick}`;
   }
-  return webcamUrl;
+  return base;
 };
 
 const formatDuration = (totalSeconds: number): string => {
@@ -197,11 +202,8 @@ function PrinterDetail({
 
   const cameraUrl = useMemo(() => {
     if (!printer.webcamUrl) return null;
-    if (cameraMode === "stream") return printer.webcamUrl;
-    const snapshotUrl = buildSnapshotUrl(printer.webcamUrl);
-    const separator = snapshotUrl.includes("?") ? "&" : "?";
-    return `${snapshotUrl}${separator}_t=${snapshotTick}`;
-  }, [cameraMode, printer.webcamUrl, snapshotTick]);
+    return buildProxyCameraUrl(printer.id, cameraMode, snapshotTick);
+  }, [cameraMode, printer.id, printer.webcamUrl, snapshotTick]);
 
   const data = statusQuery.data;
   const hasCamera = Boolean(printer.webcamUrl);
