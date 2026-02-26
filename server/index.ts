@@ -76,9 +76,13 @@ app.get('/health', (c) => c.json({ status: 'ok' }));
 
 
 // MCP route
+const mcpPassword = process.env.MCP_PASSWORD;
+if (!mcpPassword) {
+    throw new Error('MCP_PASSWORD environment variable is required');
+}
 app.use('/mcp', basicAuth({
     username: 'bot',
-    password: process.env.MCP_PASSWORD ?? 'mcppassword',
+    password: mcpPassword,
     realm: 'Inventory System MCP',
     invalidUserMessage: 'Access denied: Invalid credentials',
 }));

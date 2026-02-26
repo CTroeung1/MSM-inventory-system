@@ -15,8 +15,8 @@ const ENDPOINT = process.env.S3_ENDPOINT ?? "http://localhost:9000";
  *   S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_ENDPOINT, S3_BUCKET
  */
 export const s3 = new S3Client({
-  accessKeyId: process.env.S3_ACCESS_KEY_ID ?? "admin",
-  secretAccessKey: process.env.S3_SECRET_ACCESS_KEY ?? "password123",
+  accessKeyId: process.env.S3_ACCESS_KEY_ID,
+  secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
   endpoint: ENDPOINT,
   bucket: BUCKET,
 });
