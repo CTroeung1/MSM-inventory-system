@@ -40,8 +40,9 @@ const ipAddressSchema = z
     message: "This IP address is not allowed for printer connections.",
   });
 
+const NULL_CHAR_RE = new RegExp(String.fromCharCode(0), "g");
 const sanitizeDbText = (value: string, maxLength = 4000) =>
-  value.replace(/\u0000/g, "").slice(0, maxLength);
+  value.replace(NULL_CHAR_RE, "").slice(0, maxLength);
 
 const MAX_BAMBU_PRINT_FILE_SIZE_BYTES = 1024 * 1024 * 1024;
 
@@ -481,7 +482,15 @@ export const printRouter = router({
             timePrinting: null,
             fileName: null,
             filamentType: null,
-            amsTrays: [] as { trayId: number; trayType: string; traySubBrands: string; trayColor: string; trayInfoIdx: string; remain: number; isEmpty: boolean }[],
+            amsTrays: [] as {
+              trayId: number;
+              trayType: string;
+              traySubBrands: string;
+              trayColor: string;
+              trayInfoIdx: string;
+              remain: number;
+              isEmpty: boolean;
+            }[],
           };
         }
 
@@ -695,7 +704,8 @@ export const printRouter = router({
             status.job?.time_remaining ?? job?.time_remaining ?? null,
           timePrinting: status.job?.time_printing ?? job?.time_printing ?? null,
           fileName: job?.file?.display_name ?? job?.file?.name ?? null,
-          filamentType: job?.file?.meta?.filament_type ?? job?.file?.meta?.material ?? null,
+          filamentType:
+            job?.file?.meta?.filament_type ?? job?.file?.meta?.material ?? null,
           amsTrays: [],
           chamberTemp: null,
         };

@@ -59,7 +59,9 @@ export default function PrintGcode() {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [filamentInfo, setFilamentInfo] = useState<ThreeMfFilamentInfo | null>(null);
+  const [filamentInfo, setFilamentInfo] = useState<ThreeMfFilamentInfo | null>(
+    null,
+  );
   const [amsMapping, setAmsMapping] = useState<number[]>([0]);
   const [useAms, setUseAms] = useState(true);
 
@@ -76,7 +78,10 @@ export default function PrintGcode() {
       const info = parse3mf(buffer);
       setFilamentInfo(info);
 
-      if (info.existingAmsMapping && info.existingAmsMapping.length >= info.filamentCount) {
+      if (
+        info.existingAmsMapping &&
+        info.existingAmsMapping.length >= info.filamentCount
+      ) {
         setAmsMapping(info.existingAmsMapping.slice(0, info.filamentCount));
       } else {
         setAmsMapping(Array.from({ length: info.filamentCount }, (_, i) => i));
@@ -334,90 +339,121 @@ export default function PrintGcode() {
                 )}
               </div>
             </div>
-            {isBambu && selectedFile && filamentInfo && filamentInfo.filamentCount > 0 && (
-              <div className="space-y-3 rounded-lg border border-border/50 bg-muted/30 p-4">
-                <div className="flex items-center justify-between">
-                  <Label className="text-sm font-medium">AMS Filament Mapping</Label>
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={useAms}
-                      onChange={(e) => setUseAms(e.target.checked)}
-                      className="rounded border-input"
-                    />
-                    Use AMS
-                  </label>
-                </div>
-                {!useAms && (
-                  <p className="text-xs text-muted-foreground">
-                    AMS disabled — printer will use the external spool.
-                  </p>
-                )}
-                {useAms && (
-                  <div className="space-y-2">
-                    <p className="text-xs text-muted-foreground">
-                      {filamentInfo.filamentCount === 1
-                        ? "This print uses 1 filament. Select which AMS tray to use."
-                        : `This print uses ${filamentInfo.filamentCount} filaments. Map each to an AMS tray.`}
-                    </p>
-                    <div className="grid gap-2">
-                      {Array.from({ length: filamentInfo.filamentCount }, (_, i) => (
-                        <div key={i} className="flex items-center gap-3">
-                          <span className="text-sm text-muted-foreground w-24 shrink-0">
-                            Filament {i + 1}
-                          </span>
-                          <Select
-                            value={String(amsMapping[i] ?? i)}
-                            onValueChange={(val) => {
-                              setAmsMapping((prev) => {
-                                const next = [...prev];
-                                next[i] = parseInt(val, 10);
-                                return next;
-                              });
-                            }}
-                          >
-                            <SelectTrigger className="w-full">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {hasLiveAmsData ? (
-                                amsTrays.map((tray) => {
-                                  const color = trayColorToHex(tray.trayColor);
-                                  return (
-                                    <SelectItem key={tray.trayId} value={String(tray.trayId)}>
-                                      <span className="flex items-center gap-2">
-                                        {color && (
-                                          <span
-                                            className="inline-block h-3 w-3 rounded-full border border-border/50 shrink-0"
-                                            style={{ backgroundColor: color }}
-                                          />
-                                        )}
-                                        {getTrayLabel(tray.trayId)}
-                                      </span>
-                                    </SelectItem>
-                                  );
-                                })
-                              ) : (
-                                <>
-                                  <SelectItem value="0">AMS Tray 1</SelectItem>
-                                  <SelectItem value="1">AMS Tray 2</SelectItem>
-                                  <SelectItem value="2">AMS Tray 3</SelectItem>
-                                  <SelectItem value="3">AMS Tray 4</SelectItem>
-                                  <SelectItem value="4">AMS 2 Tray 1</SelectItem>
-                                  <SelectItem value="5">AMS 2 Tray 2</SelectItem>
-                                  <SelectItem value="6">AMS 2 Tray 3</SelectItem>
-                                  <SelectItem value="7">AMS 2 Tray 4</SelectItem>
-                                </>
-                              )}
-                            </SelectContent>
-                          </Select>
-                        </div>
-                      ))}
-                    </div>
+            {isBambu &&
+              selectedFile &&
+              filamentInfo &&
+              filamentInfo.filamentCount > 0 && (
+                <div className="space-y-3 rounded-lg border border-border/50 bg-muted/30 p-4">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-sm font-medium">
+                      AMS Filament Mapping
+                    </Label>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={useAms}
+                        onChange={(e) => setUseAms(e.target.checked)}
+                        className="rounded border-input"
+                      />
+                      Use AMS
+                    </label>
                   </div>
-                )}
-              </div>
-            )}
+                  {!useAms && (
+                    <p className="text-xs text-muted-foreground">
+                      AMS disabled — printer will use the external spool.
+                    </p>
+                  )}
+                  {useAms && (
+                    <div className="space-y-2">
+                      <p className="text-xs text-muted-foreground">
+                        {filamentInfo.filamentCount === 1
+                          ? "This print uses 1 filament. Select which AMS tray to use."
+                          : `This print uses ${filamentInfo.filamentCount} filaments. Map each to an AMS tray.`}
+                      </p>
+                      <div className="grid gap-2">
+                        {Array.from(
+                          { length: filamentInfo.filamentCount },
+                          (_, i) => (
+                            <div key={i} className="flex items-center gap-3">
+                              <span className="text-sm text-muted-foreground w-24 shrink-0">
+                                Filament {i + 1}
+                              </span>
+                              <Select
+                                value={String(amsMapping[i] ?? i)}
+                                onValueChange={(val) => {
+                                  setAmsMapping((prev) => {
+                                    const next = [...prev];
+                                    next[i] = parseInt(val, 10);
+                                    return next;
+                                  });
+                                }}
+                              >
+                                <SelectTrigger className="w-full">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {hasLiveAmsData ? (
+                                    amsTrays.map((tray) => {
+                                      const color = trayColorToHex(
+                                        tray.trayColor,
+                                      );
+                                      return (
+                                        <SelectItem
+                                          key={tray.trayId}
+                                          value={String(tray.trayId)}
+                                        >
+                                          <span className="flex items-center gap-2">
+                                            {color && (
+                                              <span
+                                                className="inline-block h-3 w-3 rounded-full border border-border/50 shrink-0"
+                                                style={{
+                                                  backgroundColor: color,
+                                                }}
+                                              />
+                                            )}
+                                            {getTrayLabel(tray.trayId)}
+                                          </span>
+                                        </SelectItem>
+                                      );
+                                    })
+                                  ) : (
+                                    <>
+                                      <SelectItem value="0">
+                                        AMS Tray 1
+                                      </SelectItem>
+                                      <SelectItem value="1">
+                                        AMS Tray 2
+                                      </SelectItem>
+                                      <SelectItem value="2">
+                                        AMS Tray 3
+                                      </SelectItem>
+                                      <SelectItem value="3">
+                                        AMS Tray 4
+                                      </SelectItem>
+                                      <SelectItem value="4">
+                                        AMS 2 Tray 1
+                                      </SelectItem>
+                                      <SelectItem value="5">
+                                        AMS 2 Tray 2
+                                      </SelectItem>
+                                      <SelectItem value="6">
+                                        AMS 2 Tray 3
+                                      </SelectItem>
+                                      <SelectItem value="7">
+                                        AMS 2 Tray 4
+                                      </SelectItem>
+                                    </>
+                                  )}
+                                </SelectContent>
+                              </Select>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             <Button
               type="submit"
               disabled={

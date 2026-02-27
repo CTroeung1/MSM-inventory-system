@@ -198,7 +198,13 @@ async function sendPrintCommand(
     }, 15_000);
 
     client.on("connect", () => {
-      const payload = buildPrintPayload(remotePath, plateNumber, useLeveling, useAms, amsMapping);
+      const payload = buildPrintPayload(
+        remotePath,
+        plateNumber,
+        useLeveling,
+        useAms,
+        amsMapping,
+      );
 
       client.publish(requestTopic, payload, { qos: 0 }, (err) => {
         clearTimeout(timeout);
@@ -236,6 +242,7 @@ function validateBambuInputs(params: {
   }
 
   // Validate access code is non-empty and doesn't contain control chars
+  // eslint-disable-next-line no-control-regex
   if (!params.accessCode || /[\x00-\x1f]/.test(params.accessCode)) {
     throw new Error("Invalid or missing Bambu access code.");
   }
@@ -451,14 +458,18 @@ function mergeReportIntoStatus(
           if (isNaN(slotId) || slotId < 0) continue;
           const globalTrayId = unitId * 4 + slotId;
           // A tray with only "id" (and optionally "state") keys is empty
-          const keys = Object.keys(t).filter((k) => k !== "id" && k !== "state");
+          const keys = Object.keys(t).filter(
+            (k) => k !== "id" && k !== "state",
+          );
           const isEmpty = keys.length === 0;
           trays.push({
             trayId: globalTrayId,
             trayType: typeof t.tray_type === "string" ? t.tray_type : "",
-            traySubBrands: typeof t.tray_sub_brands === "string" ? t.tray_sub_brands : "",
+            traySubBrands:
+              typeof t.tray_sub_brands === "string" ? t.tray_sub_brands : "",
             trayColor: typeof t.tray_color === "string" ? t.tray_color : "",
-            trayInfoIdx: typeof t.tray_info_idx === "string" ? t.tray_info_idx : "",
+            trayInfoIdx:
+              typeof t.tray_info_idx === "string" ? t.tray_info_idx : "",
             remain: typeof t.remain === "number" ? t.remain : -1,
             isEmpty,
           });
@@ -466,13 +477,23 @@ function mergeReportIntoStatus(
       }
       // Include external spool (vt_tray) as tray 254 if present
       if (vtTray && typeof vtTray === "object") {
-        const vtKeys = Object.keys(vtTray).filter((k) => k !== "id" && k !== "state");
+        const vtKeys = Object.keys(vtTray).filter(
+          (k) => k !== "id" && k !== "state",
+        );
         trays.push({
           trayId: 254,
-          trayType: typeof vtTray.tray_type === "string" ? vtTray.tray_type : "",
-          traySubBrands: typeof vtTray.tray_sub_brands === "string" ? vtTray.tray_sub_brands : "",
-          trayColor: typeof vtTray.tray_color === "string" ? vtTray.tray_color : "",
-          trayInfoIdx: typeof vtTray.tray_info_idx === "string" ? vtTray.tray_info_idx : "",
+          trayType:
+            typeof vtTray.tray_type === "string" ? vtTray.tray_type : "",
+          traySubBrands:
+            typeof vtTray.tray_sub_brands === "string"
+              ? vtTray.tray_sub_brands
+              : "",
+          trayColor:
+            typeof vtTray.tray_color === "string" ? vtTray.tray_color : "",
+          trayInfoIdx:
+            typeof vtTray.tray_info_idx === "string"
+              ? vtTray.tray_info_idx
+              : "",
           remain: typeof vtTray.remain === "number" ? vtTray.remain : -1,
           isEmpty: vtKeys.length === 0,
         });
