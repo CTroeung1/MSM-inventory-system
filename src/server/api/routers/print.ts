@@ -1,7 +1,7 @@
-import { router, userProcedure } from "@/server/trpc";
+import { router, userProcedure, adminProcedure } from "@/server/trpc";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isIP } from "node:net";
 import { Prisma } from "@prisma/client";
@@ -10,52 +10,41 @@ import {
   sanitizeFilename,
   validateGcodePayload,
 } from "@/server/api/utils/print/print.utils";
+import {
+  uploadFile,
+  downloadFile,
+  presignDownload,
+  buildPrintJobS3Key,
+} from "@/server/lib/s3";
+import { dispatchToBambu, getBambuStatus } from "@/server/lib/bambu";
 
 const printerTypeSchema = z.enum(["PRUSA", "BAMBU"]);
-const ipAddressSchema = z.string().refine((value) => isIP(value) !== 0, {
-  message: "Invalid IP address",
-});
+const isBlockedIp = (ip: string): boolean => {
+  // Block loopback
+  if (ip === "127.0.0.1" || ip === "::1" || ip.startsWith("127.")) return true;
+  // Block IPv6 loopback/unspecified
+  if (ip === "::" || ip === "0.0.0.0") return true;
+  // Block cloud metadata endpoints (169.254.169.254)
+  if (ip === "169.254.169.254") return true;
+  // Block IPv6 link-local that maps to metadata
+  if (ip.toLowerCase() === "fd00::a9fe:a9fe") return true;
+  return false;
+};
 
+const ipAddressSchema = z
+  .string()
+  .refine((value) => isIP(value) !== 0, {
+    message: "Invalid IP address",
+  })
+  .refine((value) => !isBlockedIp(value), {
+    message: "This IP address is not allowed for printer connections.",
+  });
+
+const NULL_CHAR_RE = new RegExp(String.fromCharCode(0), "g");
 const sanitizeDbText = (value: string, maxLength = 4000) =>
-  value.replace(/\u0000/g, "").slice(0, maxLength);
+  value.replace(NULL_CHAR_RE, "").slice(0, maxLength);
 
 const MAX_BAMBU_PRINT_FILE_SIZE_BYTES = 1024 * 1024 * 1024;
-const printerConfigCandidates = [
-  join(process.cwd(), "config", "printers.local.json"),
-  join(process.cwd(), "config", "printers.json"),
-];
-
-type PrinterMonitoringConfigEntry = {
-  ipAddress?: string;
-  webcamUrl?: string;
-};
-
-const loadPrinterMonitoringConfigMap = async () => {
-  for (const path of printerConfigCandidates) {
-    try {
-      const raw = await readFile(path, "utf8");
-      const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed)) {
-        continue;
-      }
-
-      const entries = parsed as PrinterMonitoringConfigEntry[];
-      const map = new Map<string, string>();
-      for (const entry of entries) {
-        const ipAddress = entry?.ipAddress?.trim();
-        const webcamUrl = entry?.webcamUrl?.trim();
-        if (ipAddress && webcamUrl) {
-          map.set(ipAddress, webcamUrl);
-        }
-      }
-      return map;
-    } catch {
-      // Try next config source or fall back to empty config.
-    }
-  }
-
-  return new Map<string, string>();
-};
 
 const validateUploadPayloadForPrinter = (
   printerType: "PRUSA" | "BAMBU",
@@ -85,6 +74,8 @@ const validateUploadPayloadForPrinter = (
   }
 };
 
+// ─── Printer dispatch ────────────────────────────────────────────────────────
+
 const dispatchToPrinter = async (params: {
   printerType: "PRUSA" | "BAMBU";
   ipAddress: string;
@@ -93,6 +84,8 @@ const dispatchToPrinter = async (params: {
   authToken?: string | null;
   serialNumber?: string | null;
   mode?: "upload_only" | "start_only" | "upload_and_start";
+  useAms?: boolean;
+  amsMapping?: number[];
 }) => {
   const {
     printerType,
@@ -102,6 +95,8 @@ const dispatchToPrinter = async (params: {
     authToken,
     serialNumber,
     mode = "upload_and_start",
+    useAms,
+    amsMapping,
   } = params;
 
   if (printerType === "PRUSA") {
@@ -125,7 +120,7 @@ const dispatchToPrinter = async (params: {
       if (!statusRes.ok) {
         throw new TRPCError({
           code: "BAD_REQUEST",
-            message: `Prusa status check failed (${statusRes.status}): ${sanitizeDbText(await statusRes.text())}`,
+          message: `Prusa status check failed (${statusRes.status}): ${sanitizeDbText(await statusRes.text())}`,
         });
       }
       return (await statusRes.json()) as PrusaStatusResponse;
@@ -149,9 +144,10 @@ const dispatchToPrinter = async (params: {
         prusaStorageName = storageName;
       }
     } catch (error) {
-      if (error instanceof TRPCError) {
-        throw error;
-      }
+      console.error(
+        "Prusa status probe failed:",
+        error instanceof Error ? error.message : error,
+      );
       // Ignore status probe failures; upload attempt below will surface the real error.
     }
 
@@ -240,7 +236,8 @@ const dispatchToPrinter = async (params: {
           continue;
         }
 
-        if (uploadRes.ok) {
+        if (uploadRes.ok || uploadRes.status === 409) {
+          // 409 = file already exists on printer storage — treat as success
           resolvedStorageForStart = candidate.storage;
           uploadSucceeded = true;
           break;
@@ -290,7 +287,12 @@ const dispatchToPrinter = async (params: {
     let startSucceeded = false;
     const startErrors: string[] = [];
     const encodedStartFilename = encodeURIComponent(originalFilename);
-    const startAttempts = [
+    const startAttempts: {
+      method: "POST";
+      endpoint: string;
+      headers: Record<string, string>;
+      body: string | undefined;
+    }[] = [
       {
         method: "POST" as const,
         endpoint: `/api/v1/files/${resolvedStorageForStart}/${encodedStartFilename}`,
@@ -361,7 +363,11 @@ const dispatchToPrinter = async (params: {
         }
         await new Promise((resolve) => setTimeout(resolve, 750));
       }
-    } catch {
+    } catch (error) {
+      console.error(
+        "Post-start status poll failed:",
+        error instanceof Error ? error.message : error,
+      );
       // Non-fatal: upload+start already succeeded.
     }
 
@@ -371,49 +377,69 @@ const dispatchToPrinter = async (params: {
     };
   }
 
+  // ─── Bambu dispatch (inlined, no separate bridge service) ──────────────────
+
   if (mode !== "upload_and_start") {
     throw new TRPCError({
       code: "BAD_REQUEST",
-      message: "Separate upload/start flow is not supported for Bambu printers in this build.",
+      message:
+        "Separate upload/start flow is not supported for Bambu printers in this build.",
     });
   }
 
-  const bambuBridgeUrl = process.env.BAMBU_BRIDGE_URL;
-  if (!bambuBridgeUrl) {
+  // Check Bambu printer readiness via cached MQTT status
+  if (serialNumber && authToken) {
+    const bambuStatus = getBambuStatus(ipAddress, authToken, serialNumber);
+    if (bambuStatus) {
+      const gcodeState = bambuStatus.gcodeState.toUpperCase();
+      const blockedBambuStates = new Set(["RUNNING", "PAUSE", "PREPARE"]);
+      if (blockedBambuStates.has(gcodeState)) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: `Bambu printer is not ready to start a new job (state=${gcodeState}).`,
+        });
+      }
+    }
+  }
+
+  if (!fileBuffer) {
     throw new TRPCError({
       code: "BAD_REQUEST",
-      message:
-        "Bambu dispatch requires BAMBU_BRIDGE_URL env var (bridge service endpoint).",
+      message: "No file content provided for Bambu dispatch.",
     });
   }
 
-  const response = await fetch(bambuBridgeUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      ipAddress,
-      serialNumber,
-      authToken,
-      fileName: originalFilename,
-      fileContentBase64: fileBuffer.toString("base64"),
-    }),
+  if (!authToken) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Missing authToken (Bambu access code).",
+    });
+  }
+
+  const bambuResult = await dispatchToBambu({
+    ipAddress,
+    accessCode: authToken,
+    serialNumber: serialNumber ?? "",
+    fileName: originalFilename,
+    fileBuffer,
+    useAms,
+    amsMapping,
   });
 
-  if (!response.ok) {
-    const errorBody = await response.text();
+  if (!bambuResult.ok) {
     throw new TRPCError({
       code: "BAD_REQUEST",
-      message: `Bambu bridge dispatch failed (${response.status}): ${sanitizeDbText(errorBody)}`,
+      message: `Bambu dispatch failed: ${bambuResult.details}`,
     });
   }
 
   return {
     dispatched: true,
-    details: "File handed off to Bambu bridge service.",
+    details: bambuResult.details,
   };
 };
+
+// ─── Router ──────────────────────────────────────────────────────────────────
 
 export const printRouter = router({
   getPrinters: userProcedure.query(async ({ ctx }) => {
@@ -422,18 +448,294 @@ export const printRouter = router({
     });
   }),
 
-  getPrinterMonitoringOptions: userProcedure.query(async ({ ctx }) => {
-    const [printers, webcamUrlByIp] = await Promise.all([
-      ctx.prisma.printer.findMany({
-        orderBy: { createdAt: "desc" },
+  getPrinterStatus: userProcedure
+    .input(
+      z.object({
+        printerIpAddress: ipAddressSchema,
       }),
-      loadPrinterMonitoringConfigMap(),
-    ]);
+    )
+    .query(async ({ ctx, input }) => {
+      const printer = await ctx.prisma.printer.findUnique({
+        where: { ipAddress: input.printerIpAddress },
+      });
 
-    return printers.map((printer) => ({
-      ...printer,
-      webcamUrl: webcamUrlByIp.get(printer.ipAddress) ?? null,
-    }));
+      if (!printer) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Printer not found.",
+        });
+      }
+
+      if (printer.type === "BAMBU") {
+        if (!printer.authToken || !printer.serialNumber) {
+          return {
+            state: "UNKNOWN",
+            stateMessage:
+              "Bambu printer requires an access code and serial number. Configure them in Printer Management.",
+            nozzleTemp: null,
+            targetNozzleTemp: null,
+            bedTemp: null,
+            targetBedTemp: null,
+            chamberTemp: null,
+            progress: null,
+            timeRemaining: null,
+            timePrinting: null,
+            fileName: null,
+            filamentType: null,
+            amsTrays: [] as {
+              trayId: number;
+              trayType: string;
+              traySubBrands: string;
+              trayColor: string;
+              trayInfoIdx: string;
+              remain: number;
+              isEmpty: boolean;
+            }[],
+          };
+        }
+
+        try {
+          const bambuStatus = getBambuStatus(
+            printer.ipAddress,
+            printer.authToken,
+            printer.serialNumber,
+          );
+
+          if (!bambuStatus) {
+            return {
+              state: "CONNECTING",
+              stateMessage: "Connecting to Bambu printer\u2026",
+              nozzleTemp: null,
+              targetNozzleTemp: null,
+              bedTemp: null,
+              targetBedTemp: null,
+              chamberTemp: null,
+              progress: null,
+              timeRemaining: null,
+              timePrinting: null,
+              fileName: null,
+              filamentType: null,
+              amsTrays: [],
+            };
+          }
+
+          const gcodeState = bambuStatus.gcodeState.toUpperCase();
+          const progressText =
+            bambuStatus.progress != null
+              ? ` (${Math.round(bambuStatus.progress)}%)`
+              : "";
+
+          let state: string;
+          let stateMessage: string;
+          switch (gcodeState) {
+            case "RUNNING":
+              state = "PRINTING";
+              stateMessage = `Printing in progress${progressText}`;
+              break;
+            case "PAUSE":
+              state = "PAUSED";
+              stateMessage = "Paused";
+              break;
+            case "FINISH":
+              state = "FINISHED";
+              stateMessage = "Finished";
+              break;
+            case "FAILED":
+              state = "IDLE";
+              stateMessage = "Last print failed";
+              break;
+            case "PREPARE":
+              state = "BUSY";
+              stateMessage = "Preparing";
+              break;
+            case "IDLE":
+            default:
+              state = gcodeState === "IDLE" ? "IDLE" : gcodeState;
+              stateMessage = gcodeState === "IDLE" ? "Ready" : gcodeState;
+              break;
+          }
+
+          return {
+            state,
+            stateMessage,
+            nozzleTemp: bambuStatus.nozzleTemp,
+            targetNozzleTemp: bambuStatus.targetNozzleTemp,
+            bedTemp: bambuStatus.bedTemp,
+            targetBedTemp: bambuStatus.targetBedTemp,
+            chamberTemp: bambuStatus.chamberTemp,
+            progress: bambuStatus.progress,
+            timeRemaining:
+              bambuStatus.remainingTimeMinutes != null
+                ? bambuStatus.remainingTimeMinutes * 60
+                : null,
+            timePrinting: null,
+            fileName: bambuStatus.fileName,
+            filamentType: bambuStatus.filamentType ?? null,
+            amsTrays: bambuStatus.amsTrays,
+          };
+        } catch (error) {
+          console.error(
+            "Bambu status check failed:",
+            error instanceof Error ? error.message : error,
+          );
+          return {
+            state: "UNREACHABLE",
+            stateMessage: "Could not connect to Bambu printer.",
+            nozzleTemp: null,
+            targetNozzleTemp: null,
+            bedTemp: null,
+            targetBedTemp: null,
+            chamberTemp: null,
+            progress: null,
+            timeRemaining: null,
+            timePrinting: null,
+            fileName: null,
+            filamentType: null,
+            amsTrays: [],
+          };
+        }
+      }
+
+      if (!printer.authToken) {
+        return {
+          state: "UNKNOWN",
+          stateMessage: "No auth token configured for this printer.",
+          nozzleTemp: null,
+          targetNozzleTemp: null,
+          bedTemp: null,
+          targetBedTemp: null,
+          progress: null,
+          timeRemaining: null,
+          timePrinting: null,
+          fileName: null,
+          filamentType: null,
+          amsTrays: [],
+          chamberTemp: null,
+        };
+      }
+
+      try {
+        const [statusRes, jobRes] = await Promise.all([
+          fetch(`http://${printer.ipAddress}/api/v1/status`, {
+            headers: { "X-Api-Key": printer.authToken },
+            signal: AbortSignal.timeout(5000),
+          }),
+          fetch(`http://${printer.ipAddress}/api/v1/job`, {
+            headers: { "X-Api-Key": printer.authToken },
+            signal: AbortSignal.timeout(5000),
+          }),
+        ]);
+
+        if (!statusRes.ok) {
+          return {
+            state: "UNREACHABLE",
+            stateMessage: `Status check failed (HTTP ${statusRes.status}).`,
+            nozzleTemp: null,
+            targetNozzleTemp: null,
+            bedTemp: null,
+            targetBedTemp: null,
+            progress: null,
+            timeRemaining: null,
+            timePrinting: null,
+            fileName: null,
+            filamentType: null,
+            amsTrays: [],
+            chamberTemp: null,
+          };
+        }
+
+        interface PrusaStatusResponse {
+          printer?: {
+            state?: string;
+            temp_nozzle?: number;
+            target_nozzle?: number;
+            temp_bed?: number;
+            target_bed?: number;
+          };
+          job?: {
+            id?: number;
+            progress?: number;
+            time_remaining?: number;
+            time_printing?: number;
+          };
+        }
+
+        interface PrusaJobResponse {
+          id?: number;
+          state?: string;
+          progress?: number;
+          time_remaining?: number;
+          time_printing?: number;
+          file?: {
+            name?: string;
+            display_name?: string;
+            meta?: {
+              filament_type?: string;
+              material?: string;
+            };
+          };
+        }
+
+        const status = (await statusRes.json()) as PrusaStatusResponse;
+        const job =
+          jobRes.status === 204
+            ? null
+            : ((await jobRes.json()) as PrusaJobResponse);
+
+        const state = status.printer?.state?.trim() ?? "UNKNOWN";
+        const progressValue = status.job?.progress ?? job?.progress ?? null;
+        const progressText =
+          progressValue != null ? ` (${Math.round(progressValue)}%)` : "";
+
+        return {
+          state,
+          stateMessage:
+            state === "PRINTING"
+              ? `Printing in progress${progressText}`
+              : state === "IDLE" || state === "READY" || state === "FINISHED"
+                ? "Ready"
+                : state,
+          nozzleTemp: status.printer?.temp_nozzle ?? null,
+          targetNozzleTemp: status.printer?.target_nozzle ?? null,
+          bedTemp: status.printer?.temp_bed ?? null,
+          targetBedTemp: status.printer?.target_bed ?? null,
+          progress: progressValue,
+          timeRemaining:
+            status.job?.time_remaining ?? job?.time_remaining ?? null,
+          timePrinting: status.job?.time_printing ?? job?.time_printing ?? null,
+          fileName: job?.file?.display_name ?? job?.file?.name ?? null,
+          filamentType:
+            job?.file?.meta?.filament_type ?? job?.file?.meta?.material ?? null,
+          amsTrays: [],
+          chamberTemp: null,
+        };
+      } catch (error) {
+        console.error(
+          "Prusa status/job fetch failed:",
+          error instanceof Error ? error.message : error,
+        );
+        return {
+          state: "UNREACHABLE",
+          stateMessage: "Could not reach printer.",
+          nozzleTemp: null,
+          targetNozzleTemp: null,
+          bedTemp: null,
+          targetBedTemp: null,
+          progress: null,
+          timeRemaining: null,
+          timePrinting: null,
+          fileName: null,
+          filamentType: null,
+          amsTrays: [],
+          chamberTemp: null,
+        };
+      }
+    }),
+
+  getPrinterMonitoringOptions: userProcedure.query(async ({ ctx }) => {
+    return ctx.prisma.printer.findMany({
+      orderBy: { createdAt: "desc" },
+    });
   }),
 
   listMyPrintJobs: userProcedure.query(async ({ ctx }) => {
@@ -445,7 +747,45 @@ export const printRouter = router({
     });
   }),
 
-  createPrinter: userProcedure
+  getDownloadUrl: userProcedure
+    .input(
+      z.object({
+        printJobId: z.string().uuid(),
+      }),
+    )
+    .query(async ({ ctx, input }) => {
+      const printJob = await ctx.prisma.gcodePrintJob.findFirst({
+        where: {
+          id: input.printJobId,
+          userId: ctx.user.id,
+        },
+      });
+
+      if (!printJob) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Print job not found.",
+        });
+      }
+
+      if (!printJob.s3Key) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message:
+            "This print job was created before S3 storage was enabled. File is not available for download.",
+        });
+      }
+
+      const url = presignDownload(printJob.s3Key, 3600);
+
+      return {
+        url,
+        filename: printJob.originalFilename,
+        expiresInSeconds: 3600,
+      };
+    }),
+
+  createPrinter: adminProcedure
     .input(
       z.object({
         name: z.string().min(1),
@@ -453,6 +793,7 @@ export const printRouter = router({
         ipAddress: ipAddressSchema,
         authToken: z.string().optional(),
         serialNumber: z.string().optional(),
+        webcamUrl: z.string().url().optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
@@ -464,8 +805,89 @@ export const printRouter = router({
             ipAddress: input.ipAddress,
             authToken: input.authToken,
             serialNumber: input.serialNumber,
+            webcamUrl: input.webcamUrl,
+
             createdByUserId: ctx.user.id,
           },
+        });
+      } catch (error) {
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === "P2002"
+        ) {
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "A printer with this IP address already exists.",
+          });
+        }
+
+        throw error;
+      }
+    }),
+
+  deletePrinter: adminProcedure
+    .input(
+      z.object({
+        printerId: z.string().uuid(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const printer = await ctx.prisma.printer.findUnique({
+        where: { id: input.printerId },
+        select: { id: true, _count: { select: { printJobs: true } } },
+      });
+
+      if (!printer) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Printer not found.",
+        });
+      }
+
+      if (printer._count.printJobs > 0) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: `Cannot delete printer: it has ${printer._count.printJobs} associated print job(s). Remove them first.`,
+        });
+      }
+
+      await ctx.prisma.printer.delete({
+        where: { id: input.printerId },
+      });
+
+      return { deleted: true };
+    }),
+
+  updatePrinter: adminProcedure
+    .input(
+      z.object({
+        printerId: z.string().uuid(),
+        name: z.string().min(1).optional(),
+        type: printerTypeSchema.optional(),
+        ipAddress: ipAddressSchema.optional(),
+        authToken: z.string().nullable().optional(),
+        serialNumber: z.string().nullable().optional(),
+        webcamUrl: z.string().url().nullable().optional(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const { printerId, ...data } = input;
+
+      const existing = await ctx.prisma.printer.findUnique({
+        where: { id: printerId },
+      });
+
+      if (!existing) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Printer not found.",
+        });
+      }
+
+      try {
+        return await ctx.prisma.printer.update({
+          where: { id: printerId },
+          data,
         });
       } catch (error) {
         if (
@@ -505,22 +927,34 @@ export const printRouter = router({
       const fileBuffer = Buffer.from(input.fileContentBase64, "base64");
 
       try {
-        validateUploadPayloadForPrinter(printer.type, input.fileName, fileBuffer);
+        validateUploadPayloadForPrinter(
+          printer.type,
+          input.fileName,
+          fileBuffer,
+        );
       } catch (error) {
         throw new TRPCError({
           code: "BAD_REQUEST",
           message:
-            error instanceof Error ? error.message : "Invalid print file payload.",
+            error instanceof Error
+              ? error.message
+              : "Invalid print file payload.",
         });
       }
 
       const sha256 = hashBufferSha256(fileBuffer);
       const safeName = sanitizeFilename(input.fileName);
-      const storedName = `${Date.now()}_${sha256.slice(0, 12)}_${safeName}`;
-      const storageRoot = join(process.cwd(), "uploads", "gcodes");
-      await mkdir(storageRoot, { recursive: true });
-      const storedPath = join(storageRoot, storedName);
-      await writeFile(storedPath, fileBuffer);
+      const timestamp = Date.now();
+      const storedName = `${timestamp}_${sha256.slice(0, 12)}_${safeName}`;
+      const s3Key = buildPrintJobS3Key(
+        ctx.user.id,
+        timestamp,
+        sha256.slice(0, 12),
+        safeName,
+      );
+
+      // Upload to S3
+      await uploadFile(s3Key, fileBuffer);
 
       const printJob = await ctx.prisma.gcodePrintJob.create({
         data: {
@@ -528,6 +962,7 @@ export const printRouter = router({
           printerId: printer.id,
           originalFilename: input.fileName,
           storedFilename: storedName,
+          s3Key,
           fileHashSha256: sha256,
           fileSizeBytes: fileBuffer.length,
           status: "STORED",
@@ -596,19 +1031,40 @@ export const printRouter = router({
         });
       }
 
-      const storedPath = join(process.cwd(), "uploads", "gcodes", printJob.storedFilename);
-
+      // Download file from S3 (fall back to legacy local path for old jobs)
       let fileBuffer: Buffer;
-      try {
-        fileBuffer = await readFile(storedPath);
-      } catch (error) {
-        throw new TRPCError({
-          code: "NOT_FOUND",
-          message:
-            error instanceof Error
-              ? `Stored file not found: ${error.message}`
-              : "Stored file not found.",
-        });
+      if (printJob.s3Key) {
+        try {
+          const bytes = await downloadFile(printJob.s3Key);
+          fileBuffer = Buffer.from(bytes);
+        } catch (error) {
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message:
+              error instanceof Error
+                ? `S3 file not found: ${error.message}`
+                : "S3 file not found.",
+          });
+        }
+      } else {
+        // Legacy fallback: try local filesystem for pre-S3 jobs
+        const storedPath = join(
+          process.cwd(),
+          "uploads",
+          "gcodes",
+          printJob.storedFilename,
+        );
+        try {
+          fileBuffer = await readFile(storedPath);
+        } catch (error) {
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message:
+              error instanceof Error
+                ? `Stored file not found: ${error.message}`
+                : "Stored file not found.",
+          });
+        }
       }
 
       try {
@@ -655,85 +1111,146 @@ export const printRouter = router({
         printerIpAddress: ipAddressSchema,
         fileName: z.string().min(1),
         fileContentBase64: z.string().min(1),
+        useAms: z.boolean().optional(),
+        amsMapping: z.array(z.number().int().min(-1).max(255)).optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      const storedJob = await ctx.prisma.$transaction(async (tx) => {
-        const printer = await tx.printer.findUnique({
-          where: { ipAddress: input.printerIpAddress },
+      const printer = await ctx.prisma.printer.findUnique({
+        where: { ipAddress: input.printerIpAddress },
+      });
+
+      if (!printer) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "No configured printer found for that IP address.",
         });
+      }
 
-        if (!printer) {
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: "No configured printer found for that IP address.",
-          });
-        }
+      const fileBuffer = Buffer.from(input.fileContentBase64, "base64");
 
-        const fileBuffer = Buffer.from(input.fileContentBase64, "base64");
+      try {
+        validateUploadPayloadForPrinter(
+          printer.type,
+          input.fileName,
+          fileBuffer,
+        );
+      } catch (error) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            error instanceof Error
+              ? error.message
+              : "Invalid print file payload.",
+        });
+      }
 
-        try {
-          validateUploadPayloadForPrinter(
-            printer.type,
-            input.fileName,
-            fileBuffer,
-          );
-        } catch (error) {
-          throw new TRPCError({
-            code: "BAD_REQUEST",
-            message:
-              error instanceof Error ? error.message : "Invalid print file payload.",
-          });
-        }
+      const sha256 = hashBufferSha256(fileBuffer);
+      const safeName = sanitizeFilename(input.fileName);
 
-        const sha256 = hashBufferSha256(fileBuffer);
-        const safeName = sanitizeFilename(input.fileName);
-        const storedName = `${Date.now()}_${sha256.slice(0, 12)}_${safeName}`;
-        const storageRoot = join(process.cwd(), "uploads", "gcodes");
-        await mkdir(storageRoot, { recursive: true });
-        await writeFile(join(storageRoot, storedName), fileBuffer);
+      // Check if a file with the same hash already exists for this printer
+      const existingJob = await ctx.prisma.gcodePrintJob.findFirst({
+        where: {
+          fileHashSha256: sha256,
+          printerId: printer.id,
+          s3Key: { not: null },
+        },
+        orderBy: { createdAt: "desc" },
+      });
 
-        return tx.gcodePrintJob.create({
+      if (existingJob) {
+        // File already stored — just dispatch it
+        const newJob = await ctx.prisma.gcodePrintJob.create({
           data: {
             userId: ctx.user.id,
             printerId: printer.id,
             originalFilename: input.fileName,
-            storedFilename: storedName,
+            storedFilename: existingJob.storedFilename,
+            s3Key: existingJob.s3Key,
             fileHashSha256: sha256,
             fileSizeBytes: fileBuffer.length,
             status: "STORED",
           },
         });
+
+        try {
+          const dispatchResult = await dispatchToPrinter({
+            printerType: printer.type,
+            ipAddress: printer.ipAddress,
+            fileBuffer,
+            originalFilename: safeName,
+            authToken: printer.authToken,
+            serialNumber: printer.serialNumber,
+            useAms: input.useAms,
+            amsMapping: input.amsMapping,
+          });
+
+          return await ctx.prisma.gcodePrintJob.update({
+            where: { id: newJob.id },
+            data: {
+              status: "DISPATCHED",
+              dispatchResponse:
+                `Re-used existing file. ${dispatchResult.details ?? ""}`.trim(),
+            },
+          });
+        } catch (error) {
+          const message = sanitizeDbText(
+            error instanceof Error ? error.message : "Unknown dispatch error",
+          );
+          await ctx.prisma.gcodePrintJob.update({
+            where: { id: newJob.id },
+            data: {
+              status: "DISPATCH_FAILED",
+              dispatchError: message,
+            },
+          });
+
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: `Dispatch failed: ${message}`,
+          });
+        }
+      }
+
+      // New file — upload to S3 then dispatch
+      const timestamp = Date.now();
+      const storedName = `${timestamp}_${sha256.slice(0, 12)}_${safeName}`;
+      const s3Key = buildPrintJobS3Key(
+        ctx.user.id,
+        timestamp,
+        sha256.slice(0, 12),
+        safeName,
+      );
+
+      await uploadFile(s3Key, fileBuffer);
+
+      const storedJob = await ctx.prisma.gcodePrintJob.create({
+        data: {
+          userId: ctx.user.id,
+          printerId: printer.id,
+          originalFilename: input.fileName,
+          storedFilename: storedName,
+          s3Key,
+          fileHashSha256: sha256,
+          fileSizeBytes: fileBuffer.length,
+          status: "STORED",
+        },
       });
 
       try {
-        const reloaded = await ctx.prisma.gcodePrintJob.findUnique({
-          where: { id: storedJob.id },
-          include: { printer: true },
-        });
-
-        if (!reloaded) {
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: "Stored print job not found after upload.",
-          });
-        }
-
-        const fileBuffer = await readFile(
-          join(process.cwd(), "uploads", "gcodes", reloaded.storedFilename),
-        );
-
         const dispatchResult = await dispatchToPrinter({
-          printerType: reloaded.printer.type,
-          ipAddress: reloaded.printer.ipAddress,
+          printerType: printer.type,
+          ipAddress: printer.ipAddress,
           fileBuffer,
-          originalFilename: sanitizeFilename(reloaded.originalFilename),
-          authToken: reloaded.printer.authToken,
-          serialNumber: reloaded.printer.serialNumber,
+          originalFilename: safeName,
+          authToken: printer.authToken,
+          serialNumber: printer.serialNumber,
+          useAms: input.useAms,
+          amsMapping: input.amsMapping,
         });
 
         return await ctx.prisma.gcodePrintJob.update({
-          where: { id: reloaded.id },
+          where: { id: storedJob.id },
           data: {
             status: "DISPATCHED",
             dispatchResponse: dispatchResult.details,
@@ -754,6 +1271,126 @@ export const printRouter = router({
         throw new TRPCError({
           code: "BAD_REQUEST",
           message: `Dispatch failed: ${message}`,
+        });
+      }
+    }),
+
+  reprintJob: userProcedure
+    .input(
+      z.object({
+        printJobId: z.string().uuid(),
+        printerIpAddress: ipAddressSchema,
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const originalJob = await ctx.prisma.gcodePrintJob.findFirst({
+        where: {
+          id: input.printJobId,
+          userId: ctx.user.id,
+        },
+      });
+
+      if (!originalJob) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Print job not found.",
+        });
+      }
+
+      if (!originalJob.s3Key) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message:
+            "This print job was created before S3 storage was enabled. File is not available for reprint.",
+        });
+      }
+
+      const printer = await ctx.prisma.printer.findUnique({
+        where: { ipAddress: input.printerIpAddress },
+      });
+
+      if (!printer) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "No configured printer found for that IP address.",
+        });
+      }
+
+      let fileBuffer: Buffer;
+      try {
+        const bytes = await downloadFile(originalJob.s3Key);
+        fileBuffer = Buffer.from(bytes);
+      } catch (error) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message:
+            error instanceof Error
+              ? `S3 file not found: ${error.message}`
+              : "S3 file not found.",
+        });
+      }
+
+      try {
+        validateUploadPayloadForPrinter(
+          printer.type,
+          originalJob.originalFilename,
+          fileBuffer,
+        );
+      } catch (error) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            error instanceof Error
+              ? error.message
+              : "File is not compatible with the target printer.",
+        });
+      }
+
+      const newJob = await ctx.prisma.gcodePrintJob.create({
+        data: {
+          userId: ctx.user.id,
+          printerId: printer.id,
+          originalFilename: originalJob.originalFilename,
+          storedFilename: originalJob.storedFilename,
+          s3Key: originalJob.s3Key,
+          fileHashSha256: originalJob.fileHashSha256,
+          fileSizeBytes: originalJob.fileSizeBytes,
+          status: "STORED",
+        },
+      });
+
+      try {
+        const dispatchResult = await dispatchToPrinter({
+          printerType: printer.type,
+          ipAddress: printer.ipAddress,
+          fileBuffer,
+          originalFilename: sanitizeFilename(originalJob.originalFilename),
+          authToken: printer.authToken,
+          serialNumber: printer.serialNumber,
+        });
+
+        return await ctx.prisma.gcodePrintJob.update({
+          where: { id: newJob.id },
+          data: {
+            status: "DISPATCHED",
+            dispatchResponse: `Reprint. ${dispatchResult.details ?? ""}`.trim(),
+          },
+        });
+      } catch (error) {
+        const message = sanitizeDbText(
+          error instanceof Error ? error.message : "Unknown dispatch error",
+        );
+        await ctx.prisma.gcodePrintJob.update({
+          where: { id: newJob.id },
+          data: {
+            status: "DISPATCH_FAILED",
+            dispatchError: message,
+          },
+        });
+
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: `Reprint failed: ${message}`,
         });
       }
     }),

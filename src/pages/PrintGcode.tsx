@@ -1,11 +1,19 @@
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useState, useRef, useCallback } from "react";
 import { trpc } from "@/client/trpc";
+import { parse3mf, type ThreeMfFilamentInfo } from "@/lib/parse-3mf";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
+
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { toast } from "sonner";
+import { Upload, X, File as FileIcon } from "lucide-react";
 
 const readFileAsBase64 = (file: File): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -27,38 +35,20 @@ export default function PrintGcode() {
   const printersQuery = trpc.print.getPrinters.useQuery();
   const jobsQuery = trpc.print.listMyPrintJobs.useQuery();
 
-  const uploadAndStoreMutation = trpc.print.uploadAndStore.useMutation({
-    onSuccess: (result) => {
-      setLastStoredJob({
-        id: result.id,
-        originalFilename: result.originalFilename,
-        storedFilename: result.storedFilename,
-        status: result.status,
-      });
-      toast.success("G-code uploaded to printer, hashed, and stored locally.");
-      void jobsQuery.refetch();
-    },
-    onError: (error) => toast.error(error.message),
-  });
   const uploadAndPrintMutation = trpc.print.uploadAndPrint.useMutation({
     onSuccess: (result) => {
-      setLastStoredJob({
-        id: result.id,
-        originalFilename: result.originalFilename,
-        storedFilename: result.storedFilename,
-        status: result.status,
-      });
-      toast.success(result.dispatchResponse ?? "File uploaded and print dispatched.");
+      toast.success(
+        result.dispatchResponse ?? "File uploaded and print started.",
+      );
+      void handleFileSelected(null);
       void jobsQuery.refetch();
     },
     onError: (error) => toast.error(error.message),
   });
-  const startPrintMutation = trpc.print.startStoredPrint.useMutation({
+
+  const reprintMutation = trpc.print.reprintJob.useMutation({
     onSuccess: (result) => {
-      setLastStoredJob((prev) =>
-        prev && prev.id === result.id ? { ...prev, status: result.status } : prev,
-      );
-      toast.success(result.dispatchResponse ?? "Print start command sent.");
+      toast.success(result.dispatchResponse ?? "Reprint started.");
       void jobsQuery.refetch();
     },
     onError: (error) => toast.error(error.message),
@@ -66,75 +56,152 @@ export default function PrintGcode() {
 
   const [selectedPrinterIp, setSelectedPrinterIp] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [lastStoredJob, setLastStoredJob] = useState<{
-    id: string;
-    originalFilename: string;
-    storedFilename: string;
-    status: string;
-  } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [filamentInfo, setFilamentInfo] = useState<ThreeMfFilamentInfo | null>(
+    null,
+  );
+  const [amsMapping, setAmsMapping] = useState<number[]>([0]);
+  const [useAms, setUseAms] = useState(true);
+
+  const handleFileSelected = useCallback(async (file: File | null) => {
+    setSelectedFile(file);
+    setFilamentInfo(null);
+    setAmsMapping([0]);
+    setUseAms(true);
+
+    if (!file?.name.toLowerCase().endsWith(".3mf")) return;
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const info = parse3mf(buffer);
+      setFilamentInfo(info);
+
+      if (
+        info.existingAmsMapping &&
+        info.existingAmsMapping.length >= info.filamentCount
+      ) {
+        setAmsMapping(info.existingAmsMapping.slice(0, info.filamentCount));
+      } else {
+        setAmsMapping(Array.from({ length: info.filamentCount }, (_, i) => i));
+      }
+
+      if (info.existingUseAms !== null) {
+        setUseAms(info.existingUseAms);
+      }
+    } catch {
+      // Parsing failed — continue with defaults, user can still print
+    }
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      void handleFileSelected(files[0] ?? null);
+    }
+  }, []);
+
+  const statusQuery = trpc.print.getPrinterStatus.useQuery(
+    { printerIpAddress: selectedPrinterIp },
+    { enabled: !!selectedPrinterIp, refetchInterval: 10_000 },
+  );
+
+  const BLOCKED_PRINTER_STATES = new Set([
+    "PRINTING",
+    "PAUSED",
+    "BUSY",
+    "ATTENTION",
+    "UNREACHABLE",
+  ]);
+  const printerBusy =
+    !!statusQuery.data &&
+    BLOCKED_PRINTER_STATES.has(statusQuery.data.state.toUpperCase());
 
   const printerOptions = printersQuery.data ?? [];
   const selectedPrinter =
-    printerOptions.find((printer) => printer.ipAddress === selectedPrinterIp) ?? null;
-  const isBambuSelected = selectedPrinter?.type === "BAMBU";
-  const isUploadPending =
-    uploadAndStoreMutation.isPending || uploadAndPrintMutation.isPending;
+    printerOptions.find((printer) => printer.ipAddress === selectedPrinterIp) ??
+    null;
+  const isBambu = selectedPrinter?.type === "BAMBU";
 
-  const submitUpload = async (e: FormEvent) => {
+  // AMS tray data from live printer status (excludes external spool tray 254)
+  const amsTrays = (statusQuery.data?.amsTrays ?? []).filter(
+    (t) => t.trayId !== 254 && !t.isEmpty,
+  );
+  const hasLiveAmsData = amsTrays.length > 0;
+
+  /** Build a human-readable label for an AMS tray slot. */
+  const getTrayLabel = (trayId: number): string => {
+    const tray = amsTrays.find((t) => t.trayId === trayId);
+    if (tray) {
+      const name = tray.traySubBrands || tray.trayType;
+      if (name) return name;
+    }
+    // Fallback to generic label
+    const unit = Math.floor(trayId / 4);
+    const slot = (trayId % 4) + 1;
+    return unit === 0 ? `AMS Tray ${slot}` : `AMS ${unit + 1} Tray ${slot}`;
+  };
+
+  /** Parse tray_color (RRGGBBAA) to CSS hex color. */
+  const trayColorToHex = (color: string): string | null => {
+    if (!color || color.length < 6 || color === "00000000") return null;
+    return `#${color.slice(0, 6)}`;
+  };
+
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!selectedFile || !selectedPrinterIp) {
-      toast.error("Select a printer and a print file.");
+      toast.error("Select a printer and a file.");
       return;
     }
 
     const fileContentBase64 = await readFileAsBase64(selectedFile);
-    if (isBambuSelected) {
-      await uploadAndPrintMutation.mutateAsync({
-        printerIpAddress: selectedPrinterIp,
-        fileName: selectedFile.name,
-        fileContentBase64,
-      });
-      return;
-    }
-
-    await uploadAndStoreMutation.mutateAsync({
+    await uploadAndPrintMutation.mutateAsync({
       printerIpAddress: selectedPrinterIp,
       fileName: selectedFile.name,
       fileContentBase64,
-    });
-  };
-
-  const startStoredPrint = async () => {
-    if (!lastStoredJob) {
-      toast.error("Upload and store a file first.");
-      return;
-    }
-
-    await startPrintMutation.mutateAsync({
-      printJobId: lastStoredJob.id,
+      ...(isBambu && { useAms, amsMapping }),
     });
   };
 
   return (
     <div className="p-6 space-y-6">
       <div>
-        <h1 className="text-3xl font-bold">G-code Printing</h1>
+        <h1 className="text-3xl font-bold">Print</h1>
         <p className="text-muted-foreground">
-          Prusa printers use upload/store then start. Bambu printers use upload-and-print (.3mf) via the local bridge.
+          Select a printer, choose a file, and hit print.
         </p>
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle>
-            {isBambuSelected ? "Upload and print (Bambu)" : "Upload to printer, store, then print"}
-          </CardTitle>
+          <CardTitle>Upload and Print</CardTitle>
         </CardHeader>
         <CardContent>
-          <form onSubmit={submitUpload} className="space-y-4">
+          <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
               <Label>Printer</Label>
-              <Select value={selectedPrinterIp} onValueChange={setSelectedPrinterIp}>
+              <Select
+                value={selectedPrinterIp}
+                onValueChange={setSelectedPrinterIp}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="Select a printer" />
                 </SelectTrigger>
@@ -148,47 +215,266 @@ export default function PrintGcode() {
               </Select>
               {printerOptions.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  No printers are available. Printers must be configured in the backend/database first.
+                  No printers available. Add printers via the Printer Management
+                  page.
+                </p>
+              ) : null}
+              {selectedPrinter && statusQuery.data ? (
+                <div
+                  className={`rounded-md border px-3 py-2 text-sm ${
+                    {
+                      PRINTING:
+                        "border-yellow-500/50 bg-yellow-500/10 text-yellow-700 dark:text-yellow-400",
+                      PAUSED:
+                        "border-yellow-500/50 bg-yellow-500/10 text-yellow-700 dark:text-yellow-400",
+                      BUSY: "border-yellow-500/50 bg-yellow-500/10 text-yellow-700 dark:text-yellow-400",
+                      ATTENTION:
+                        "border-red-500/50 bg-red-500/10 text-red-700 dark:text-red-400",
+                      UNREACHABLE:
+                        "border-red-500/50 bg-red-500/10 text-red-700 dark:text-red-400",
+                      IDLE: "border-green-500/50 bg-green-500/10 text-green-700 dark:text-green-400",
+                      READY:
+                        "border-green-500/50 bg-green-500/10 text-green-700 dark:text-green-400",
+                      FINISHED:
+                        "border-green-500/50 bg-green-500/10 text-green-700 dark:text-green-400",
+                    }[statusQuery.data.state] ??
+                    "border-muted bg-muted/50 text-muted-foreground"
+                  }`}
+                >
+                  <span className="font-medium">Status:</span>{" "}
+                  {statusQuery.data.stateMessage}
+                </div>
+              ) : null}
+              {selectedPrinter && statusQuery.isLoading ? (
+                <p className="text-sm text-muted-foreground">
+                  Checking printer status…
                 </p>
               ) : null}
             </div>
             <div className="space-y-2">
-              <Label>{isBambuSelected ? "3MF file" : "G-code file"}</Label>
-              <Input
-                type="file"
-                accept={isBambuSelected ? ".3mf,application/octet-stream" : ".gcode,.gc,.gco,.bgcode,text/plain"}
-                onChange={(e) => setSelectedFile(e.target.files?.[0] ?? null)}
-              />
+              <Label>{isBambu ? "3MF file" : "G-code file"}</Label>
+              <div
+                className={`relative flex flex-col items-center justify-center rounded-lg border-2 border-dashed p-8 text-center transition-colors cursor-pointer
+                  ${
+                    isDragging
+                      ? "border-primary bg-primary/5"
+                      : "border-muted-foreground/25 bg-muted/50 hover:bg-muted"
+                  }
+                `}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  className="hidden"
+                  accept={
+                    isBambu
+                      ? ".3mf,application/octet-stream"
+                      : ".gcode,.gc,.gco,.bgcode,text/plain"
+                  }
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) {
+                      void handleFileSelected(file);
+                    }
+                  }}
+                />
+
+                {selectedFile ? (
+                  <div className="flex flex-col items-center gap-3 relative w-full max-w-sm mx-auto p-4 rounded-md border border-border/50 bg-background/50 shadow-sm transition-all hover:shadow-md">
+                    <div className="flex items-center gap-3 w-full">
+                      <div className="rounded-md bg-primary/10 p-2.5">
+                        <FileIcon className="h-5 w-5 text-primary" />
+                      </div>
+                      <div className="flex flex-col items-start flex-1 overflow-hidden text-left">
+                        <div
+                          className="text-sm font-medium truncate w-full"
+                          title={selectedFile.name}
+                        >
+                          {selectedFile.name}
+                        </div>
+                        <div className="text-xs text-muted-foreground mt-0.5">
+                          {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
+                        </div>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-muted-foreground hover:bg-destructive/10 hover:text-destructive flex-shrink-0"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleFileSelected(null);
+                          if (fileInputRef.current) {
+                            fileInputRef.current.value = "";
+                          }
+                        }}
+                      >
+                        <X className="h-4 w-4" />
+                        <span className="sr-only">Remove file</span>
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center gap-4">
+                    <div className="rounded-full bg-background p-4 shadow-sm border border-border/50 transition-transform group-hover:scale-105">
+                      <Upload className="h-6 w-6 text-muted-foreground" />
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-sm font-medium">
+                        Drag and drop your file here, or{" "}
+                        <span className="text-primary hover:underline">
+                          click to browse
+                        </span>
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        Supports{" "}
+                        {isBambu ? ".3mf" : ".gcode, .gc, .gco, .bgcode"}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
+            {isBambu &&
+              selectedFile &&
+              filamentInfo &&
+              filamentInfo.filamentCount > 0 && (
+                <div className="space-y-3 rounded-lg border border-border/50 bg-muted/30 p-4">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-sm font-medium">
+                      AMS Filament Mapping
+                    </Label>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={useAms}
+                        onChange={(e) => setUseAms(e.target.checked)}
+                        className="rounded border-input"
+                      />
+                      Use AMS
+                    </label>
+                  </div>
+                  {!useAms && (
+                    <p className="text-xs text-muted-foreground">
+                      AMS disabled — printer will use the external spool.
+                    </p>
+                  )}
+                  {useAms && (
+                    <div className="space-y-2">
+                      <p className="text-xs text-muted-foreground">
+                        {filamentInfo.filamentCount === 1
+                          ? "This print uses 1 filament. Select which AMS tray to use."
+                          : `This print uses ${filamentInfo.filamentCount} filaments. Map each to an AMS tray.`}
+                      </p>
+                      <div className="grid gap-2">
+                        {Array.from(
+                          { length: filamentInfo.filamentCount },
+                          (_, i) => (
+                            <div key={i} className="flex items-center gap-3">
+                              <span className="text-sm text-muted-foreground w-24 shrink-0">
+                                Filament {i + 1}
+                              </span>
+                              <Select
+                                value={String(amsMapping[i] ?? i)}
+                                onValueChange={(val) => {
+                                  setAmsMapping((prev) => {
+                                    const next = [...prev];
+                                    next[i] = parseInt(val, 10);
+                                    return next;
+                                  });
+                                }}
+                              >
+                                <SelectTrigger className="w-full">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {hasLiveAmsData ? (
+                                    amsTrays.map((tray) => {
+                                      const color = trayColorToHex(
+                                        tray.trayColor,
+                                      );
+                                      return (
+                                        <SelectItem
+                                          key={tray.trayId}
+                                          value={String(tray.trayId)}
+                                        >
+                                          <span className="flex items-center gap-2">
+                                            {color && (
+                                              <span
+                                                className="inline-block h-3 w-3 rounded-full border border-border/50 shrink-0"
+                                                style={{
+                                                  backgroundColor: color,
+                                                }}
+                                              />
+                                            )}
+                                            {getTrayLabel(tray.trayId)}
+                                          </span>
+                                        </SelectItem>
+                                      );
+                                    })
+                                  ) : (
+                                    <>
+                                      <SelectItem value="0">
+                                        AMS Tray 1
+                                      </SelectItem>
+                                      <SelectItem value="1">
+                                        AMS Tray 2
+                                      </SelectItem>
+                                      <SelectItem value="2">
+                                        AMS Tray 3
+                                      </SelectItem>
+                                      <SelectItem value="3">
+                                        AMS Tray 4
+                                      </SelectItem>
+                                      <SelectItem value="4">
+                                        AMS 2 Tray 1
+                                      </SelectItem>
+                                      <SelectItem value="5">
+                                        AMS 2 Tray 2
+                                      </SelectItem>
+                                      <SelectItem value="6">
+                                        AMS 2 Tray 3
+                                      </SelectItem>
+                                      <SelectItem value="7">
+                                        AMS 2 Tray 4
+                                      </SelectItem>
+                                    </>
+                                  )}
+                                </SelectContent>
+                              </Select>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             <Button
               type="submit"
-              disabled={isUploadPending || printersQuery.isLoading || printerOptions.length === 0}
+              disabled={
+                uploadAndPrintMutation.isPending ||
+                printersQuery.isLoading ||
+                printerOptions.length === 0 ||
+                !selectedFile ||
+                !selectedPrinterIp ||
+                (!!selectedPrinterIp && statusQuery.isLoading) ||
+                printerBusy
+              }
             >
-              {isBambuSelected
-                ? "Upload to Bridge and Print"
-                : "Upload to Printer, Hash, and Store"}
+              {uploadAndPrintMutation.isPending
+                ? "Printing..."
+                : statusQuery.isLoading && selectedPrinterIp
+                  ? "Checking printer\u2026"
+                  : printerBusy
+                    ? "Printer busy"
+                    : "Upload and Print"}
             </Button>
           </form>
-
-          {!isBambuSelected ? (
-            <div className="mt-6 space-y-3 border-t pt-4">
-            <div className="space-y-1">
-              <Label>Stored file ready to start</Label>
-              <p className="text-sm text-muted-foreground">
-                {lastStoredJob
-                  ? `${lastStoredJob.originalFilename} (stored as ${lastStoredJob.storedFilename}, status=${lastStoredJob.status})`
-                  : "No file uploaded in this session yet."}
-              </p>
-            </div>
-            <Button
-              type="button"
-              onClick={startStoredPrint}
-              disabled={!lastStoredJob || startPrintMutation.isPending}
-            >
-              Start Print (Stored File)
-            </Button>
-            </div>
-          ) : null}
 
           {jobsQuery.data && jobsQuery.data.length > 0 ? (
             <div className="mt-6 space-y-2 border-t pt-4">
@@ -197,25 +483,38 @@ export default function PrintGcode() {
                 {jobsQuery.data.slice(0, 5).map((job) => (
                   <div
                     key={job.id}
-                    className="flex flex-col gap-2 rounded-md border p-3 md:flex-row md:items-center md:justify-between"
+                    className="flex items-center gap-3 rounded-md border p-3 text-sm"
                   >
-                    <div className="text-sm">
-                      <div>{job.originalFilename}</div>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium truncate">
+                        {job.originalFilename}
+                      </div>
                       <div className="text-muted-foreground">
-                        {job.printer.name} ({job.printer.type}) • {job.status}
+                        {job.printer.name} ({job.printer.type}) &bull;{" "}
+                        {job.status}
                       </div>
                     </div>
                     <Button
                       type="button"
                       variant="outline"
-                      disabled={startPrintMutation.isPending || job.printer.type === "BAMBU"}
+                      size="sm"
+                      disabled={
+                        !selectedPrinterIp ||
+                        printerBusy ||
+                        (!!selectedPrinterIp && statusQuery.isLoading) ||
+                        reprintMutation.isPending
+                      }
                       onClick={() =>
-                        startPrintMutation.mutate({
+                        reprintMutation.mutate({
                           printJobId: job.id,
+                          printerIpAddress: selectedPrinterIp,
                         })
                       }
                     >
-                      {job.printer.type === "BAMBU" ? "Start Print (Prusa only)" : "Start Print"}
+                      {reprintMutation.isPending &&
+                      reprintMutation.variables?.printJobId === job.id
+                        ? "Reprinting\u2026"
+                        : "Reprint"}
                     </Button>
                   </div>
                 ))}
