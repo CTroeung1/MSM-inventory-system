@@ -1,7 +1,7 @@
 import { tool } from "@langchain/core/tools";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ChatOllama } from "@langchain/ollama";
+import { ChatOpenAI } from "@langchain/openai";
 import { z } from "zod";
 import { router, userProcedure } from "@/server/trpc";
 import { prisma } from "@/server/lib/prisma";
@@ -102,14 +102,13 @@ function convertStringTypes(obj: ConvertibleValue): ConvertibleValue {
 
 // Ollama Provider with MCP tool integration
 class OllamaMcpProvider implements AIProvider {
-  private readonly llm: ChatOllama;
+  private readonly llm: ChatOpenAI;
   private readonly mcpClient: Client;
   private readonly transport: StreamableHTTPClientTransport;
   private readonly systemPrompt: string;
   private readonly ollamaUrl: string;
   private readonly model: string;
   private readonly mcpEndpoint: string;
-  private readonly authToken: string;
 
   constructor(
     ollamaUrl = process.env.OLLAMA_URL ?? "",
@@ -120,7 +119,6 @@ class OllamaMcpProvider implements AIProvider {
     this.ollamaUrl = ollamaUrl;
     this.model = model;
     this.mcpEndpoint = mcpEndpoint;
-    this.authToken = authToken;
     const username = "bot";
     const password = process.env.MCP_PASSWORD;
     if (!password) {
@@ -136,6 +134,7 @@ class OllamaMcpProvider implements AIProvider {
         requestInit: {
           headers: {
             Authorization: authHeader,
+            "x-trpc-source": "mcp-server",
           },
         },
       },
@@ -144,39 +143,56 @@ class OllamaMcpProvider implements AIProvider {
       { name: "inventory-client", version: "1.0.0" },
       { capabilities: { prompts: {}, resources: {}, tools: {}, logging: {} } },
     );
-    this.llm = new ChatOllama({
-      baseUrl: this.ollamaUrl,
+    this.llm = new ChatOpenAI({
+      configuration: {
+        baseURL: this.ollamaUrl,
+      },
+      apiKey: authToken,
       model: this.model,
-      temperature: 0.7,
-      topK: 20,
-      topP: 0.8,
+      temperature: 0.2,
+      topP: 0.95,
       maxRetries: 2,
-      headers: this.authToken
-        ? { Authorization: `Bearer ${this.authToken}` }
-        : undefined,
+      frequencyPenalty: 0.1,
+      presencePenalty: 0.1,
+      stop: ["<|im_end|>", "<|endoftext|>"],
+      modelKwargs: {
+        extra_body: {
+          chat_template_kwargs: {
+            enable_thinking: false,
+          },
+        },
+      },
     });
-    this.systemPrompt = `
-You are a helpful assistant tasked with presenting inventory data in a precise, user-friendly format. When responding to user requests to fetch inventory items (e.g., "what items are in my inventory"), use the provided tool to retrieve the data. When presenting the data to the user you must format it in markdown.
-You are not supposed to help the user to code, you are just a bot to fetch information from an api and present it to the user in a nice format.
+    this.systemPrompt =
+      `You are an inventory management assistant for Monash Automation. You help users look up and understand their inventory data using the tools available to you.
 
-User Context: You have access to user context information including the user's ID and email. Use this information to personalize responses when appropriate and ensure all data access is properly scoped to the authenticated user.
+## Your Capabilities
+You have access to tools for:
+- **Items**: Search, list, and look up inventory items (assets and consumables)
+- **Locations**: Browse the location hierarchy and see what's stored where
+- **Tags & Tag Groups**: View how items are categorized
+- **Users & Groups**: Look up user info and group memberships
+- **Transactions**: View checkout/check-in history, audit trails, and currently loaned items
+- **Dashboard**: Get stats like loan history, top loaned items, inventory by location, and tag usage
+- **QR Codes**: Generate QR URLs and look up items by QR scan
+- **3D Printers**: Check printer status, list printers, view print job history, see all currently active prints with who started them, and browse all print jobs across all users
 
-Strict Formatting Guidelines:
-
-- Extract the items array from the tool response’s content[0].text JSON string.
-- Use the exact fields: id, name, serial, location.name, deleted, cost, createdAt.
-- Format monetary values with a "$" symbol (e.g., $30).
-- Convert the deleted boolean to "Not Deleted" (false) or "Deleted" (true) for the "Status" field.
-- Format the createdAt timestamp in a human-readable format (e.g., "October 5, 2025, 1:26 AM").
-- If any required field (id, name, serial, location.name, deleted, cost, createdAt) is missing, include it with "Unknown".
-- Create a separate "Item Details" section for each item in the items array.
-- List all items in a clear, concise manner, with a blank line between each item’s details.
-- Do not include raw JSON, JSON structure explanations (e.g., describing content, items, totalCount, page, pageSize, pageCount, tags, ItemRecords, image, locationId, stored, updatedAt), or programming code (e.g., JavaScript, Python) in the response under any circumstances unless explicitly requested by the user.
-- Do not describe the JSON structure, mention metadata fields (e.g., totalCount, page, pageSize, pageCount), or explain how to parse JSON, even if the tool output is JSON.
-- Ignore fields like image, tags, consumable, ItemRecords, locationId, stored, updatedAt, etc., unless explicitly requested.
-- For all tool calling, any argument that contains an ID (e.g., id in location_get, locationId in item_list) requires a valid UUID (a 36-character string in the format 8-4-4-4-12, like "3c383a42-a242-404b-b77e-3ae284117238") and not a name or some other kind of string. If a non-UUID string is provided or suggested for an ID field, inform the user that the ID must be a valid UUID, explain the issue briefly, provide a corrected example of the tool call format using a placeholder UUID, and refuse to proceed with the invalid call.
-- Ensure all tool calls (e.g., item_list, location_get) are formatted as proper tool call structures with name, args, id, and type fields, not as JSON strings within the content field. If an incorrect format is detected, correct it to the proper tool call structure.
-        `.trim();
+## Rules
+1. **NEVER guess, assume, or fabricate data.** Every claim you make about inventory, items, users, locations, printers, or transactions MUST come from a tool call in this conversation. If you haven't called a tool to get the data, you don't know it.
+2. **When in doubt, call a tool.** If you're even slightly unsure about an answer, call the relevant tool to verify before responding. It is always better to make a redundant tool call than to give wrong information.
+3. **Do not rely on previous conversations or memory.** Data changes constantly. Always fetch fresh data with a tool call for every question, even if you think you already know the answer.
+4. **If no tool can answer the question, say so.** Never fill in gaps with made-up data. Say "I don't have a tool to look that up" or "I couldn't find that information."
+5. ID arguments must be valid UUIDs (e.g. "3c383a42-a242-404b-b77e-3ae284117238"). If the user gives a name instead, use the appropriate list/search tool first to find the UUID, then call the detail tool.
+6. Never output raw JSON to the user. Parse tool responses and present the data clearly.
+7. Format monetary values with "$" (e.g. $30).
+8. Format dates in a human-readable way (e.g. "5 Oct 2025, 1:26 AM").
+9. When listing multiple items, use a markdown table with relevant columns.
+10. Keep responses concise. Don't explain your tool calls or JSON parsing — just show the results.
+11. If a tool returns an error or empty data, tell the user plainly (e.g. "No items found" or "That location doesn't exist"). Never invent results to fill the gap.
+12. You are read-only — you cannot create, update, or delete anything. If the user asks you to modify data, explain that you can only look up information.
+13. Do not help with coding questions — you are an inventory lookup assistant only.
+14. When the user greets you (e.g. "hello", "hi", "hey", "good morning"), always call the greeting tool first and use its response to greet them back by name.
+`.trim();
   }
 
   async init(): Promise<void> {
@@ -194,8 +210,8 @@ Strict Formatting Guidelines:
     userContext?: { id: string; email?: string },
     authHeaders?: Headers,
   ): Promise<string> {
+    let perRequestClient: Client | null = null;
     try {
-      // Create a new MCP client with both basic auth and forwarded user headers
       let mcpClient = this.mcpClient;
       if (authHeaders) {
         const forwardedHeaders: Record<string, string> = {};
@@ -203,7 +219,6 @@ Strict Formatting Guidelines:
           forwardedHeaders[key] = value;
         });
 
-        // Add basic auth for MCP endpoint access
         const username = "bot";
         const password = process.env.MCP_PASSWORD;
         if (!password) {
@@ -234,14 +249,13 @@ Strict Formatting Guidelines:
         );
 
         await mcpClient.connect(transport);
+        perRequestClient = mcpClient;
       }
 
-      // Fetch MCP tools
       const mcpTools = await mcpClient.listTools();
       const langchainTools = mcpTools.tools.map((mcpTool) =>
         tool(
           async (args) => {
-            // Add user context to the arguments if available
             const argsWithUserContext = userContext
               ? {
                   ...(args as Record<string, unknown>),
@@ -273,66 +287,85 @@ Strict Formatting Guidelines:
         ),
       );
 
-      // Bind tools to LLM
       const llmWithTools = this.llm.bindTools(langchainTools);
+
       const formattedMessages: FormattedMessage[] = [
         { role: "system", content: this.systemPrompt },
         ...messages.map((msg) => ({
           role: msg.role,
-          content: msg.content.concat(msg.role === "user" ? " /no_think" : ""),
+          content: msg.content,
         })),
       ];
-
-      // Initial LLM invocation
 
       let result = await llmWithTools.invoke(
         formattedMessages as BaseLanguageModelInput,
       );
 
-      // Handle tool calls if present
-      if (result.tool_calls?.length) {
-        for (const toolCall of result.tool_calls) {
-          let toolResult;
+      const MAX_TOOL_ROUNDS = 10;
+      let toolRound = 0;
+
+      while (result.tool_calls?.length && toolRound < MAX_TOOL_ROUNDS) {
+        toolRound++;
+
+        // 2. Format the tool calls strictly matching the API schema
+        const formattedToolCalls = result.tool_calls.map((toolCall) => ({
+          id:
+            toolCall.id ??
+            `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+          type: "function" as const,
+          function: {
+            name: toolCall.name,
+            arguments: toolCall.args ? JSON.stringify(toolCall.args) : "{}",
+          },
+        }));
+
+        // 3. Push a SINGLE assistant message containing all the requested tool calls
+        formattedMessages.push({
+          role: "assistant",
+          content: result.content,
+          tool_calls: formattedToolCalls,
+        } as any);
+
+        // 4. Execute all requested tools concurrently
+        const toolPromises = result.tool_calls.map(async (toolCall, index) => {
           try {
-            toolResult = await mcpClient.callTool({
+            const processedArgs = convertStringTypes(toolCall.args) as Record<
+              string,
+              unknown
+            >;
+            const toolResult = await mcpClient.callTool({
               name: toolCall.name,
-              arguments: convertStringTypes(toolCall.args) as Record<
-                string,
-                unknown
-              >,
+              arguments: processedArgs,
             });
+
+            return {
+              id: formattedToolCalls[index].id,
+              result: toolResult,
+            };
           } catch (error) {
-            console.error(`MCP tool call failed for ${toolCall.name}:`, error);
-            toolResult = {
-              error: `Tool call failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+            console.error(`Execution failed for tool ${toolCall.name}:`, error);
+            return {
+              id: formattedToolCalls[index].id,
+              result: {
+                error: `Tool execution failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+              },
             };
           }
+        });
 
-          // Append the tool call as a message to maintain context
-          formattedMessages.push({
-            role: "assistant",
-            content: "",
-            tool_calls: [
-              {
-                id: toolCall.id ?? `call_${Date.now()}`,
-                name: toolCall.name,
-                arguments: convertStringTypes(toolCall.args) as Record<
-                  string,
-                  unknown
-                >,
-              },
-            ],
-          });
+        // Wait for all parallel network requests to finish
+        const completedTools = await Promise.all(toolPromises);
 
-          // Append the tool result as a 'tool' message
+        // 5. Push the results back into the history as 'tool' messages
+        for (const { id, result: toolResult } of completedTools) {
           formattedMessages.push({
             role: "tool",
             content: JSON.stringify(toolResult),
-            tool_call_id: toolCall.id ?? `call_${Date.now()}`,
-          });
+            tool_call_id: id,
+          } as any);
         }
 
-        // Re-invoke LLM with updated message history including tool results
+        // 6. Re-invoke the LLM with the updated context
         result = await llmWithTools.invoke(
           formattedMessages as BaseLanguageModelInput,
         );
@@ -342,17 +375,21 @@ Strict Formatting Guidelines:
         throw new Error("LLM returned non-string response");
       }
 
-      const removeThinkTagsAtStartAndTopSpace = (text: string): string => {
-        // Remove <think> tags at the start and normalize leading space
-        const replaced = text.replace(/^<think>[\s\S]*?<\/think>\s*/, "");
-        return replaced;
-      };
-      return removeThinkTagsAtStartAndTopSpace(result.content);
+      // Final clean before sending back to the user
+      return result.content;
     } catch (error) {
       console.error("Error generating response:", error);
       throw new Error(
         `Failed to generate response: ${error instanceof Error ? error.message : "Unknown error"}`,
       );
+    } finally {
+      if (perRequestClient) {
+        try {
+          await perRequestClient.close();
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
     }
   }
 }

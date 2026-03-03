@@ -16,7 +16,12 @@ import {
   presignDownload,
   buildPrintJobS3Key,
 } from "@/server/lib/s3";
-import { dispatchToBambu, getBambuStatus } from "@/server/lib/bambu";
+import {
+  dispatchToBambu,
+  getBambuStatus,
+  sendBambuCommand,
+} from "@/server/lib/bambu";
+import { syncBambuMqttPool } from "@/server/lib/bambuMqtt";
 
 const printerTypeSchema = z.enum(["PRUSA", "BAMBU"]);
 const isBlockedIp = (ip: string): boolean => {
@@ -442,13 +447,29 @@ const dispatchToPrinter = async (params: {
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 export const printRouter = router({
-  getPrinters: userProcedure.query(async ({ ctx }) => {
-    return ctx.prisma.printer.findMany({
-      orderBy: { createdAt: "desc" },
-    });
-  }),
+  getPrinters: userProcedure
+    .meta({
+      mcp: {
+        name: "print_getPrinters",
+        enabled: true,
+        description: "List all configured 3D printers",
+      },
+    })
+    .query(async ({ ctx }) => {
+      return ctx.prisma.printer.findMany({
+        orderBy: { createdAt: "desc" },
+      });
+    }),
 
   getPrinterStatus: userProcedure
+    .meta({
+      mcp: {
+        name: "print_getPrinterStatus",
+        enabled: true,
+        description:
+          "Get the current status of a printer by its IP address, including temperatures, print progress, and state",
+      },
+    })
     .input(
       z.object({
         printerIpAddress: ipAddressSchema,
@@ -732,22 +753,263 @@ export const printRouter = router({
       }
     }),
 
-  getPrinterMonitoringOptions: userProcedure.query(async ({ ctx }) => {
-    return ctx.prisma.printer.findMany({
-      orderBy: { createdAt: "desc" },
-    });
-  }),
+  pausePrint: userProcedure
+    .input(z.object({ printerIpAddress: ipAddressSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const printer = await ctx.prisma.printer.findUnique({
+        where: { ipAddress: input.printerIpAddress },
+      });
+      if (!printer)
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Printer not found.",
+        });
 
-  listMyPrintJobs: userProcedure.query(async ({ ctx }) => {
-    return ctx.prisma.gcodePrintJob.findMany({
-      where: { userId: ctx.user.id },
-      include: { printer: true },
-      orderBy: { createdAt: "desc" },
-      take: 100,
-    });
-  }),
+      if (printer.type === "BAMBU") {
+        if (!printer.authToken || !printer.serialNumber) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Bambu printer missing access code or serial number.",
+          });
+        }
+        const result = await sendBambuCommand(
+          printer.ipAddress,
+          printer.authToken,
+          printer.serialNumber,
+          "pause",
+        );
+        if (!result.ok)
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: result.details,
+          });
+        return { success: true, message: result.details };
+      }
+
+      // Prusa: PUT /api/v1/job/{id}/pause
+      if (!printer.authToken)
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "No auth token configured.",
+        });
+      const jobRes = await fetch(`http://${printer.ipAddress}/api/v1/job`, {
+        headers: { "X-Api-Key": printer.authToken },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (jobRes.status === 204 || !jobRes.ok) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "No active print job to pause.",
+        });
+      }
+      const job = (await jobRes.json()) as { id?: number };
+      if (!job.id)
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "No active print job.",
+        });
+      const res = await fetch(
+        `http://${printer.ipAddress}/api/v1/job/${job.id}/pause`,
+        {
+          method: "PUT",
+          headers: { "X-Api-Key": printer.authToken },
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      if (!res.ok && res.status !== 204) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: `Pause failed (HTTP ${res.status}).`,
+        });
+      }
+      return { success: true, message: "Print paused." };
+    }),
+
+  resumePrint: userProcedure
+    .input(z.object({ printerIpAddress: ipAddressSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const printer = await ctx.prisma.printer.findUnique({
+        where: { ipAddress: input.printerIpAddress },
+      });
+      if (!printer)
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Printer not found.",
+        });
+
+      if (printer.type === "BAMBU") {
+        if (!printer.authToken || !printer.serialNumber) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Bambu printer missing access code or serial number.",
+          });
+        }
+        const result = await sendBambuCommand(
+          printer.ipAddress,
+          printer.authToken,
+          printer.serialNumber,
+          "resume",
+        );
+        if (!result.ok)
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: result.details,
+          });
+        return { success: true, message: result.details };
+      }
+
+      // Prusa: PUT /api/v1/job/{id}/resume
+      if (!printer.authToken)
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "No auth token configured.",
+        });
+      const jobRes = await fetch(`http://${printer.ipAddress}/api/v1/job`, {
+        headers: { "X-Api-Key": printer.authToken },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (jobRes.status === 204 || !jobRes.ok) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "No active print job to resume.",
+        });
+      }
+      const job = (await jobRes.json()) as { id?: number };
+      if (!job.id)
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "No active print job.",
+        });
+      const res = await fetch(
+        `http://${printer.ipAddress}/api/v1/job/${job.id}/resume`,
+        {
+          method: "PUT",
+          headers: { "X-Api-Key": printer.authToken },
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      if (!res.ok && res.status !== 204) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: `Resume failed (HTTP ${res.status}).`,
+        });
+      }
+      return { success: true, message: "Print resumed." };
+    }),
+
+  cancelPrint: userProcedure
+    .input(z.object({ printerIpAddress: ipAddressSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const printer = await ctx.prisma.printer.findUnique({
+        where: { ipAddress: input.printerIpAddress },
+      });
+      if (!printer)
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Printer not found.",
+        });
+
+      if (printer.type === "BAMBU") {
+        if (!printer.authToken || !printer.serialNumber) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Bambu printer missing access code or serial number.",
+          });
+        }
+        const result = await sendBambuCommand(
+          printer.ipAddress,
+          printer.authToken,
+          printer.serialNumber,
+          "stop",
+        );
+        if (!result.ok)
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: result.details,
+          });
+        return { success: true, message: result.details };
+      }
+
+      // Prusa: DELETE /api/v1/job/{id}
+      if (!printer.authToken)
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "No auth token configured.",
+        });
+      const jobRes = await fetch(`http://${printer.ipAddress}/api/v1/job`, {
+        headers: { "X-Api-Key": printer.authToken },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (jobRes.status === 204 || !jobRes.ok) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "No active print job to cancel.",
+        });
+      }
+      const job = (await jobRes.json()) as { id?: number };
+      if (!job.id)
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "No active print job.",
+        });
+      const res = await fetch(
+        `http://${printer.ipAddress}/api/v1/job/${job.id}`,
+        {
+          method: "DELETE",
+          headers: { "X-Api-Key": printer.authToken },
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      if (!res.ok && res.status !== 204) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: `Cancel failed (HTTP ${res.status}).`,
+        });
+      }
+      return { success: true, message: "Print cancelled." };
+    }),
+
+  getPrinterMonitoringOptions: userProcedure
+    .meta({
+      mcp: {
+        name: "print_getPrinterMonitoringOptions",
+        enabled: true,
+        description: "List all printers available for monitoring",
+      },
+    })
+    .query(async ({ ctx }) => {
+      return ctx.prisma.printer.findMany({
+        orderBy: { createdAt: "desc" },
+      });
+    }),
+
+  listMyPrintJobs: userProcedure
+    .meta({
+      mcp: {
+        name: "print_listMyPrintJobs",
+        enabled: true,
+        description:
+          "List the authenticated user's print jobs (up to 100 most recent), including printer info",
+      },
+    })
+    .query(async ({ ctx }) => {
+      return ctx.prisma.gcodePrintJob.findMany({
+        where: { userId: ctx.user.id },
+        include: { printer: true },
+        orderBy: { createdAt: "desc" },
+        take: 100,
+      });
+    }),
 
   getDownloadUrl: userProcedure
+    .meta({
+      mcp: {
+        name: "print_getDownloadUrl",
+        enabled: true,
+        description:
+          "Get a pre-signed download URL for a print job's file by its print job ID",
+      },
+    })
     .input(
       z.object({
         printJobId: z.string().uuid(),
@@ -798,7 +1060,7 @@ export const printRouter = router({
     )
     .mutation(async ({ ctx, input }) => {
       try {
-        return await ctx.prisma.printer.create({
+        const result = await ctx.prisma.printer.create({
           data: {
             name: input.name,
             type: input.type,
@@ -810,6 +1072,9 @@ export const printRouter = router({
             createdByUserId: ctx.user.id,
           },
         });
+        // Sync MQTT pool so the new printer gets a connection immediately
+        syncBambuMqttPool().catch(() => {});
+        return result;
       } catch (error) {
         if (
           error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -854,6 +1119,8 @@ export const printRouter = router({
       await ctx.prisma.printer.delete({
         where: { id: input.printerId },
       });
+      // Sync MQTT pool so the removed printer's connection is closed
+      syncBambuMqttPool().catch(() => {});
 
       return { deleted: true };
     }),
@@ -885,10 +1152,13 @@ export const printRouter = router({
       }
 
       try {
-        return await ctx.prisma.printer.update({
+        const result = await ctx.prisma.printer.update({
           where: { id: printerId },
           data,
         });
+        // Sync MQTT pool so changed IP/auth is picked up immediately
+        syncBambuMqttPool().catch(() => {});
+        return result;
       } catch (error) {
         if (
           error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -1393,5 +1663,162 @@ export const printRouter = router({
           message: `Reprint failed: ${message}`,
         });
       }
+    }),
+
+  getActivePrints: userProcedure
+    .meta({
+      mcp: {
+        name: "print_getActivePrints",
+        enabled: true,
+        description:
+          "Get all printers that are currently printing or paused, including what they are printing, progress, and who started the print job",
+      },
+    })
+    .query(async ({ ctx }) => {
+      const printers = await ctx.prisma.printer.findMany();
+
+      const activePrints: {
+        printerName: string;
+        printerType: string;
+        ipAddress: string;
+        state: string;
+        fileName: string | null;
+        progress: number | null;
+        timeRemaining: number | null;
+        startedBy: { name: string; email: string } | null;
+        jobStartedAt: Date | null;
+      }[] = [];
+
+      for (const printer of printers) {
+        let state = "UNKNOWN";
+        let fileName: string | null = null;
+        let progress: number | null = null;
+        let timeRemaining: number | null = null;
+
+        if (printer.type === "BAMBU") {
+          if (!printer.authToken || !printer.serialNumber) continue;
+          const bambuStatus = getBambuStatus(
+            printer.ipAddress,
+            printer.authToken,
+            printer.serialNumber,
+          );
+          if (!bambuStatus) continue;
+          const gcodeState = bambuStatus.gcodeState.toUpperCase();
+          if (gcodeState === "RUNNING") state = "PRINTING";
+          else if (gcodeState === "PAUSE") state = "PAUSED";
+          else if (gcodeState === "PREPARE") state = "PREPARING";
+          else continue;
+          fileName = bambuStatus.fileName;
+          progress = bambuStatus.progress;
+          timeRemaining =
+            bambuStatus.remainingTimeMinutes != null
+              ? bambuStatus.remainingTimeMinutes * 60
+              : null;
+        } else {
+          // Prusa
+          if (!printer.authToken) continue;
+          try {
+            const [statusRes, jobRes] = await Promise.all([
+              fetch(`http://${printer.ipAddress}/api/v1/status`, {
+                headers: { "X-Api-Key": printer.authToken },
+                signal: AbortSignal.timeout(5000),
+              }),
+              fetch(`http://${printer.ipAddress}/api/v1/job`, {
+                headers: { "X-Api-Key": printer.authToken },
+                signal: AbortSignal.timeout(5000),
+              }),
+            ]);
+            if (!statusRes.ok) continue;
+
+            interface PrusaActiveStatus {
+              printer?: { state?: string };
+              job?: { progress?: number; time_remaining?: number };
+            }
+            interface PrusaActiveJob {
+              file?: { name?: string; display_name?: string };
+              progress?: number;
+              time_remaining?: number;
+            }
+
+            const status = (await statusRes.json()) as PrusaActiveStatus;
+            const printerState =
+              status.printer?.state?.trim()?.toUpperCase() ?? "UNKNOWN";
+
+            if (printerState === "PRINTING") state = "PRINTING";
+            else if (printerState === "PAUSED") state = "PAUSED";
+            else continue;
+
+            const job =
+              jobRes.status === 204
+                ? null
+                : ((await jobRes.json()) as PrusaActiveJob);
+
+            fileName = job?.file?.display_name ?? job?.file?.name ?? null;
+            progress = status.job?.progress ?? job?.progress ?? null;
+            timeRemaining =
+              status.job?.time_remaining ?? job?.time_remaining ?? null;
+          } catch {
+            continue;
+          }
+        }
+
+        // Find who started this print — most recent DISPATCHED job for this printer
+        const recentJob = await ctx.prisma.gcodePrintJob.findFirst({
+          where: {
+            printerId: printer.id,
+            status: "DISPATCHED",
+          },
+          orderBy: { createdAt: "desc" },
+          include: {
+            user: {
+              select: { name: true, email: true },
+            },
+          },
+        });
+
+        activePrints.push({
+          printerName: printer.name,
+          printerType: printer.type,
+          ipAddress: printer.ipAddress,
+          state,
+          fileName,
+          progress,
+          timeRemaining,
+          startedBy: recentJob
+            ? { name: recentJob.user.name, email: recentJob.user.email }
+            : null,
+          jobStartedAt: recentJob?.createdAt ?? null,
+        });
+      }
+
+      return activePrints;
+    }),
+
+  getAllPrintJobs: userProcedure
+    .meta({
+      mcp: {
+        name: "print_getAllPrintJobs",
+        enabled: true,
+        description:
+          "List all print jobs across all users with user attribution (who printed), printer info, and job status. Returns the most recent jobs. Use this to find out who printed what and when.",
+      },
+    })
+    .input(
+      z
+        .object({
+          limit: z.number().int().min(1).max(500).optional(),
+        })
+        .optional(),
+    )
+    .query(async ({ ctx, input }) => {
+      const take = input?.limit ?? 100;
+      return ctx.prisma.gcodePrintJob.findMany({
+        include: {
+          user: { select: { name: true, email: true } },
+          printer: { select: { name: true, type: true, ipAddress: true } },
+        },
+        orderBy: { createdAt: "desc" },
+        take,
+      });
     }),
 });

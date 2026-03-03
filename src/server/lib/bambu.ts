@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { writeFile, unlink } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { isIP } from "node:net";
+import { getPoolClient, addMessageListener } from "@/server/lib/bambuMqtt";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -175,20 +176,39 @@ async function sendPrintCommand(
   useAms: boolean,
   amsMapping: number[],
 ): Promise<void> {
+  const requestTopic = `device/${serialNumber}/request`;
+  const payload = buildPrintPayload(
+    remotePath,
+    plateNumber,
+    useLeveling,
+    useAms,
+    amsMapping,
+  );
+
+  // Reuse shared pool connection — Bambu printers only support 1 concurrent
+  // MQTT client.
+  const poolClient = getPoolClient(serialNumber);
+  if (poolClient) {
+    return new Promise((resolve, reject) => {
+      poolClient.publish(requestTopic, payload, { qos: 0 }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+
+  // No pool connection — fall back to one-shot (printer not in DB or pool
+  // not yet initialized)
   return new Promise((resolve, reject) => {
-    const requestTopic = `device/${serialNumber}/request`;
     const clientId = `inventory-${serialNumber}-${Date.now()}`;
 
     const client = mqtt.connect(`mqtts://${ipAddress}:${BAMBU_MQTT_PORT}`, {
       username: BAMBU_MQTT_USER,
       password: accessCode,
       clientId,
-      // SECURITY: Bambu printers use self-signed TLS certificates.
-      // rejectUnauthorized must be false to connect. MitM risk is limited
-      // to the local network where the printer resides.
       rejectUnauthorized: false,
       protocol: "mqtts",
-      protocolVersion: 4, // MQTT 3.1.1 — Bambu printers don't support MQTT 5.0
+      protocolVersion: 4, // MQTT 3.1.1
       connectTimeout: 10_000,
     });
 
@@ -198,14 +218,6 @@ async function sendPrintCommand(
     }, 15_000);
 
     client.on("connect", () => {
-      const payload = buildPrintPayload(
-        remotePath,
-        plateNumber,
-        useLeveling,
-        useAms,
-        amsMapping,
-      );
-
       client.publish(requestTopic, payload, { qos: 0 }, (err) => {
         clearTimeout(timeout);
         client.end();
@@ -333,7 +345,90 @@ export async function dispatchToBambu(
   }
 }
 
-// ─── Status Monitoring via MQTT ──────────────────────────────────────────────
+// ─── Print Control Commands (pause / resume / stop) ─────────────────────────
+
+export type BambuPrintCommand = "pause" | "resume" | "stop";
+
+export async function sendBambuCommand(
+  ipAddress: string,
+  accessCode: string,
+  serialNumber: string,
+  command: BambuPrintCommand,
+): Promise<BambuDispatchResult> {
+  validateBambuInputs({ ipAddress, accessCode, serialNumber });
+
+  if (!serialNumber) {
+    return { ok: false, details: "Serial number required for MQTT command." };
+  }
+
+  const requestTopic = `device/${serialNumber}/request`;
+  const payload = JSON.stringify({
+    print: { sequence_id: "0", command, param: "" },
+  });
+
+  // Reuse shared pool connection
+  const poolClient = getPoolClient(serialNumber);
+  if (poolClient) {
+    return new Promise((resolve) => {
+      poolClient.publish(requestTopic, payload, { qos: 1 }, (err) => {
+        if (err) {
+          resolve({
+            ok: false,
+            details: `MQTT publish failed: ${err.message}`,
+          });
+        } else {
+          resolve({ ok: true, details: `Command '${command}' sent.` });
+        }
+      });
+    });
+  }
+
+  // No pool connection — fall back to one-shot
+  return new Promise((resolve) => {
+    const clientId = `inventory-cmd-${serialNumber}-${Date.now()}`;
+    const client = mqtt.connect(`mqtts://${ipAddress}:${BAMBU_MQTT_PORT}`, {
+      username: BAMBU_MQTT_USER,
+      password: accessCode,
+      clientId,
+      rejectUnauthorized: false,
+      protocol: "mqtts",
+      protocolVersion: 4,
+      connectTimeout: 10_000,
+    });
+
+    const timeout = setTimeout(() => {
+      client.end(true);
+      resolve({ ok: false, details: "MQTT connection timed out." });
+    }, 15_000);
+
+    client.on("connect", () => {
+      client.publish(requestTopic, payload, { qos: 1 }, (err) => {
+        clearTimeout(timeout);
+        client.end();
+        if (err) {
+          resolve({
+            ok: false,
+            details: `MQTT publish failed: ${err.message}`,
+          });
+        } else {
+          resolve({ ok: true, details: `Command '${command}' sent.` });
+        }
+      });
+    });
+
+    client.on("error", (err) => {
+      clearTimeout(timeout);
+      client.end(true);
+      resolve({ ok: false, details: `MQTT error: ${err.message}` });
+    });
+  });
+}
+
+// ─── Status Monitoring via Shared MQTT Pool ──────────────────────────────────
+//
+// Instead of maintaining separate MQTT connections, status monitoring piggybacks
+// on the shared pool in bambuMqtt.ts.  A message listener registered on the pool
+// feeds incoming reports into a local statusCache.
 
 export interface AmsTrayInfo {
   /** Global tray ID: (ams_unit * 4) + slot. 254 = external spool. */
@@ -369,17 +464,9 @@ export interface BambuCachedStatus {
   lastUpdated: number;
 }
 
-interface BambuMonitorEntry {
-  client: mqtt.MqttClient;
-  serialNumber: string;
-  status: BambuCachedStatus;
-  idleTimeout: ReturnType<typeof setTimeout>;
-  connecting: boolean;
-}
+// ─── Status cache (populated by pool listener) ──────────────────────────────
 
-const BAMBU_MONITOR_IDLE_MS = 300_000; // 5 minutes
-
-const monitorCache = new Map<string, BambuMonitorEntry>();
+const statusCache = new Map<string, BambuCachedStatus>();
 
 function createEmptyStatus(): BambuCachedStatus {
   return {
@@ -527,122 +614,37 @@ function mergeReportIntoStatus(
   }
 }
 
-function cleanupMonitor(serialNumber: string): void {
-  const entry = monitorCache.get(serialNumber);
-  if (!entry) return;
-  clearTimeout(entry.idleTimeout);
-  try {
-    entry.client.end(true);
-  } catch {
-    // Ignore cleanup errors
-  }
-  monitorCache.delete(serialNumber);
-}
+// ─── Pool message listener (registered once at startup) ─────────────────────
 
-function resetIdleTimeout(serialNumber: string): void {
-  const entry = monitorCache.get(serialNumber);
-  if (!entry) return;
-  clearTimeout(entry.idleTimeout);
-  entry.idleTimeout = setTimeout(() => {
-    cleanupMonitor(serialNumber);
-  }, BAMBU_MONITOR_IDLE_MS);
-}
-
-function connectBambuMonitor(
-  ipAddress: string,
-  accessCode: string,
+function handlePoolMessage(
   serialNumber: string,
+  _printerName: string,
+  msg: Record<string, unknown>,
 ): void {
-  validateBambuInputs({ ipAddress, accessCode, serialNumber });
-  if (monitorCache.has(serialNumber)) return;
+  const print = msg.print as Record<string, unknown> | undefined;
+  if (!print || typeof print !== "object") return;
 
-  const reportTopic = `device/${serialNumber}/report`;
-  const requestTopic = `device/${serialNumber}/request`;
-  const clientId = `inventory-monitor-${serialNumber}-${Date.now()}`;
-
-  const status = createEmptyStatus();
-
-  const client = mqtt.connect(`mqtts://${ipAddress}:${BAMBU_MQTT_PORT}`, {
-    username: BAMBU_MQTT_USER,
-    password: accessCode,
-    clientId,
-    // SECURITY: Bambu printers use self-signed TLS certificates.
-    // rejectUnauthorized must be false to connect. MitM risk is limited
-    // to the local network where the printer resides.
-    rejectUnauthorized: false,
-    protocol: "mqtts",
-    protocolVersion: 4, // MQTT 3.1.1 — Bambu printers don't support MQTT 5.0
-    connectTimeout: 10_000,
-    reconnectPeriod: 5_000,
-  });
-
-  const idleTimeout = setTimeout(() => {
-    cleanupMonitor(serialNumber);
-  }, BAMBU_MONITOR_IDLE_MS);
-
-  const entry: BambuMonitorEntry = {
-    client,
-    serialNumber,
-    status,
-    idleTimeout,
-    connecting: true,
-  };
-
-  monitorCache.set(serialNumber, entry);
-
-  client.on("connect", () => {
-    entry.connecting = false;
-
-    client.subscribe(reportTopic, { qos: 0 }, (err) => {
-      if (err) return;
-
-      // Request full status dump
-      const pushallPayload = JSON.stringify({
-        pushing: { sequence_id: "0", command: "pushall" },
-      });
-      client.publish(requestTopic, pushallPayload, { qos: 0 });
-    });
-  });
-
-  client.on("message", (_topic, payload) => {
-    try {
-      const msg = JSON.parse(payload.toString()) as Record<string, unknown>;
-      const print = msg.print as Record<string, unknown> | undefined;
-      if (print && typeof print === "object") {
-        mergeReportIntoStatus(entry.status, print);
-      }
-    } catch {
-      // Ignore malformed messages
-    }
-  });
-
-  client.on("error", () => {
-    cleanupMonitor(serialNumber);
-  });
-
-  client.on("close", () => {
-    monitorCache.delete(serialNumber);
-  });
+  let status = statusCache.get(serialNumber);
+  if (!status) {
+    status = createEmptyStatus();
+    statusCache.set(serialNumber, status);
+  }
+  mergeReportIntoStatus(status, print);
 }
+
+/** Register the status listener on the shared MQTT pool.  Call once. */
+export function initBambuStatusListener(): void {
+  addMessageListener(handlePoolMessage);
+}
+
+// ─── Public status query ────────────────────────────────────────────────────
 
 export function getBambuStatus(
-  ipAddress: string,
-  accessCode: string,
+  _ipAddress: string,
+  _accessCode: string,
   serialNumber: string,
 ): BambuCachedStatus | null {
-  validateBambuInputs({ ipAddress, accessCode, serialNumber });
-  const existing = monitorCache.get(serialNumber);
-
-  if (!existing) {
-    connectBambuMonitor(ipAddress, accessCode, serialNumber);
-    return null;
-  }
-
-  resetIdleTimeout(serialNumber);
-
-  if (existing.connecting || existing.status.lastUpdated === 0) {
-    return null;
-  }
-
-  return existing.status;
+  const status = statusCache.get(serialNumber);
+  if (!status || status.lastUpdated === 0) return null;
+  return status;
 }
